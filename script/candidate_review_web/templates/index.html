@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>锥桶候选筛选</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='review.css') }}">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-block">
+        <h1>锥桶候选筛选</h1>
+        <div class="progress-copy"><span id="reviewedCount">0</span> / <span id="totalCount">0</span></div>
+      </div>
+      <div class="toolbar">
+        <select id="reviewFilter" aria-label="标注状态">
+          <option value="unreviewed">未标注</option>
+          <option value="all">全部状态</option>
+          <option value="fallen_cone">已标注：倒伏</option>
+          <option value="upright_cone">已标注：直立</option>
+          <option value="not_cone">已标注：非锥桶</option>
+          <option value="ignore">已标注：忽略</option>
+        </select>
+        <select id="poolFilter" aria-label="候选池">
+          <option value="all">全部候选</option>
+        </select>
+        <select id="splitFilter" aria-label="数据划分">
+          <option value="all">全部 split</option>
+        </select>
+        <button id="undoButton" class="icon-button" type="button" title="撤销上一次（Z）" aria-label="撤销上一次" aria-keyshortcuts="Z">&#8630;</button>
+      </div>
+    </header>
+
+    <div class="progress-track" aria-hidden="true"><div id="progressBar"></div></div>
+
+    <main class="review-layout">
+      <section class="image-stage" aria-live="polite">
+        <div id="reviewStatus" class="review-status">未标注</div>
+        <div class="image-frame" id="imageFrame">
+          <img id="candidateImage" alt="当前锥桶候选">
+          <div id="emptyState" class="empty-state" hidden>当前范围已完成</div>
+        </div>
+        <div class="candidate-nav" aria-label="候选图片导航">
+          <button id="previousButton" class="nav-button" type="button" title="上一张（左方向键）" aria-label="上一张" aria-keyshortcuts="ArrowLeft">&#8592;</button>
+          <span id="candidatePosition">- / -</span>
+          <button id="nextButton" class="nav-button" type="button" title="下一张（右方向键）" aria-label="下一张" aria-keyshortcuts="ArrowRight">&#8594;</button>
+        </div>
+        <div class="view-switch" role="group" aria-label="图片视图">
+          <button class="view-option active" type="button" data-view="preview">标框</button>
+          <button class="view-option" type="button" data-view="crop">无框裁剪</button>
+        </div>
+      </section>
+
+      <aside class="metadata" id="metadataPanel">
+        <div class="meta-row"><span>候选池</span><strong id="poolName">-</strong></div>
+        <div class="meta-row"><span>split</span><strong id="sourceSplit">-</strong></div>
+        <div class="meta-row"><span>YOLO</span><strong id="confidence">-</strong></div>
+        <div class="meta-row"><span>长轴角度</span><strong id="angle">-</strong></div>
+        <div class="meta-source" id="sourceImage">-</div>
+        <div class="label-totals">
+          <button type="button" class="label-total" data-review="upright_cone" title="查看所有直立锥桶"><span id="uprightTotal">0</span><small>直立</small></button>
+          <button type="button" class="label-total" data-review="fallen_cone" title="查看所有倒伏锥桶"><span id="fallenTotal">0</span><small>倒伏</small></button>
+          <button type="button" class="label-total" data-review="not_cone" title="查看所有非锥桶"><span id="notConeTotal">0</span><small>非锥桶</small></button>
+          <button type="button" class="label-total" data-review="ignore" title="查看所有忽略项"><span id="ignoreTotal">0</span><small>忽略</small></button>
+        </div>
+      </aside>
+    </main>
+
+    <footer class="decision-bar">
+      <button type="button" class="decision upright" data-label="upright_cone" title="快捷键 1" aria-keyshortcuts="1">直立锥桶</button>
+      <button type="button" class="decision fallen" data-label="fallen_cone" title="快捷键 2" aria-keyshortcuts="2">倒伏锥桶</button>
+      <button type="button" class="decision not-cone" data-label="not_cone" title="快捷键 3" aria-keyshortcuts="3">非锥桶</button>
+      <button type="button" class="decision ignore" data-label="ignore" title="快捷键 4" aria-keyshortcuts="4">忽略 / 看不清</button>
+    </footer>
+  </div>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="{{ url_for('static', filename='review.js') }}"></script>
+</body>
+</html>

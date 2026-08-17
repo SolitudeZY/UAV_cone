@@ -24,6 +24,17 @@ def _gap_key(first_id: int, second_id: int) -> GapKey:
     return tuple(sorted((first_id, second_id)))
 
 
+def _point_in_convex_polygon(point: Point, polygon: Sequence[Point]) -> bool:
+    signs: list[bool] = []
+    for first, second in zip(polygon, (*polygon[1:], polygon[0])):
+        cross = (second[0] - first[0]) * (point[1] - first[1]) - (
+            second[1] - first[1]
+        ) * (point[0] - first[0])
+        if abs(cross) > 1e-9:
+            signs.append(cross > 0.0)
+    return not signs or all(sign == signs[0] for sign in signs)
+
+
 def _route_gap_items(
     analysis: AnalysisResult, route: Sequence[int]
 ) -> list[tuple[int, int, float, float]]:
@@ -79,6 +90,23 @@ class TrackedGap:
     normal_streak: int
     cooldown_remaining: int
     business_eligible: bool
+    alert_level: str
+    suspect_frames: int
+    strong_alert_streak: int
+    distance_ratio: float | None
+    pixel_ratio: float | None
+    measurement_conflict: bool
+    position_conflict: bool
+
+
+@dataclass(frozen=True)
+class SuppressedMissing:
+    """Raw MISSING candidate suppressed by a confirmed FALLEN cone."""
+
+    alert: MissingAlert
+    stable_route_id: int
+    fallen_stable_ids: tuple[int, ...]
+    reason: str = "fallen_occupies_expected_position"
 
 
 @dataclass(frozen=True)
@@ -87,6 +115,35 @@ class GapTrackingResult:
     routes: tuple[GapRouteThreshold, ...]
     gaps: tuple[TrackedGap, ...] = ()
     missing_gap_ids: tuple[int, ...] = ()
+    suspect: tuple[MissingAlert, ...] = ()
+    suspect_gap_ids: tuple[int, ...] = ()
+    policy: GapAlertPolicy | None = None
+    suppressed_by_fallen: tuple[SuppressedMissing, ...] = ()
+
+
+@dataclass(frozen=True)
+class GapAlertPolicy:
+    suspect_ratio: float
+    alert_ratio: float
+    vote_window: int
+    confirm_votes: int
+    suspect_frames: int
+    alert_confirm_frames: int
+    clear_frames: int
+    max_ratio_disagreement: float
+
+
+@dataclass(frozen=True)
+class _MissingCandidate:
+    alert: MissingAlert
+    distance_ratio: float
+    pixel_ratio: float
+    measurement_conflict: bool
+    position_conflict: bool
+
+    @property
+    def credible(self) -> bool:
+        return not self.measurement_conflict and not self.position_conflict
 
 
 @dataclass
@@ -94,7 +151,9 @@ class _StableGapState:
     stable_id: int
     endpoint_ids: GapKey
     votes: deque[bool]
-    active: bool = False
+    level: str = "normal"
+    suspect_frames: int = 0
+    strong_alert_streak: int = 0
     normal_streak: int = 0
     cooldown_remaining: int = 0
     last_alert: MissingAlert | None = None
@@ -107,6 +166,7 @@ class _GapState:
     cone_ids: tuple[int, ...] = ()
     centers: tuple[Point, ...] = ()
     gaps: dict[GapKey, _StableGapState] = field(default_factory=dict)
+    history_cooldown_remaining: int = 0
 
 
 @dataclass
@@ -119,9 +179,14 @@ class GapThresholdTracker:
     minimum_gap_pixels: float = 0.0
     vote_window: int = 5
     confirm_votes: int = 3
+    alert_ratio: float = 2.2
+    suspect_frames: int = 20
+    alert_confirm_frames: int = 5
+    max_ratio_disagreement: float = 0.6
     clear_frames: int = 3
     membership_cooldown_frames: int = 5
     min_alert_cones: int = 3
+    history_min_cones: int = 5
     _states: dict[int, _GapState] = field(default_factory=dict, init=False)
     _next_cone_id: int = field(default=1, init=False)
     _next_gap_id: int = field(default=1, init=False)
@@ -143,12 +208,22 @@ class GapThresholdTracker:
             raise ValueError("vote_window must be at least 1")
         if not 1 <= self.confirm_votes <= self.vote_window:
             raise ValueError("confirm_votes must be within vote_window")
+        if self.alert_ratio <= 1.0:
+            raise ValueError("alert_ratio must be greater than 1")
+        if self.suspect_frames < 1:
+            raise ValueError("suspect_frames must be at least 1")
+        if self.alert_confirm_frames < 1:
+            raise ValueError("alert_confirm_frames must be at least 1")
+        if self.max_ratio_disagreement < 0.0:
+            raise ValueError("max_ratio_disagreement must be non-negative")
         if self.clear_frames < 1:
             raise ValueError("clear_frames must be at least 1")
         if not 3 <= self.membership_cooldown_frames <= 5:
             raise ValueError("membership_cooldown_frames must be between 3 and 5")
         if self.min_alert_cones < 3:
             raise ValueError("min_alert_cones must be at least 3")
+        if self.history_min_cones < 3:
+            raise ValueError("history_min_cones must be at least 3")
 
     def _state(self, stable_id: int) -> _GapState:
         state = self._states.get(stable_id)
@@ -175,18 +250,17 @@ class GapThresholdTracker:
         self,
         state: _GapState,
         gaps: Sequence[float],
-        raw_references: Sequence[float],
+        *,
+        allow_history_update: bool,
     ) -> tuple[float | None, tuple[float, ...]]:
-        frame_average = (
-            statistics.fmean(raw_references) if raw_references else None
-        )
+        frame_average = statistics.median(gaps) if gaps else None
         excluded_close = (
             tuple(gap for gap in gaps if gap < state.nominal_gap * self.close_ratio)
             if state.nominal_gap is not None
             else ()
         )
-        if frame_average is None:
-            return None, excluded_close
+        if frame_average is None or not allow_history_update:
+            return frame_average, excluded_close
         if (
             state.nominal_gap is not None
             and frame_average < state.nominal_gap * self.close_ratio
@@ -291,7 +365,7 @@ class GapThresholdTracker:
         raw_alert: MissingAlert | None,
         nominal_gap: float,
         gap_ratio: float,
-    ) -> MissingAlert | None:
+    ) -> _MissingCandidate | None:
         if raw_alert is None:
             return None
         raw_reference = (
@@ -304,9 +378,20 @@ class GapThresholdTracker:
             raw_reference,
             self.minimum_gap_pixels if analysis.distance_unit == "pixels" else 0.0,
         )
-        if gap_distance <= reference * gap_ratio:
+        distance_ratio = gap_distance / reference
+        if distance_ratio <= gap_ratio:
             return None
-        return self._alert_for_gap(
+        pixel_reference = max(raw_alert.reference_gap_pixels, 1e-9)
+        pixel_ratio = gap_pixels / pixel_reference
+        measurement_conflict = False
+        if analysis.distance_unit != "pixels":
+            smaller_ratio = min(distance_ratio, pixel_ratio)
+            measurement_conflict = (
+                smaller_ratio <= 1e-9
+                or abs(distance_ratio - pixel_ratio) / smaller_ratio
+                > self.max_ratio_disagreement
+            )
+        alert = self._alert_for_gap(
             analysis,
             first_index,
             second_index,
@@ -315,6 +400,22 @@ class GapThresholdTracker:
             reference,
             raw_alert.reference_gap_pixels,
             raw_alert.positions,
+        )
+        endpoint_polygons = (
+            analysis.ordered[first_index].polygon,
+            analysis.ordered[second_index].polygon,
+        )
+        position_conflict = any(
+            _point_in_convex_polygon(position, polygon)
+            for position in alert.positions
+            for polygon in endpoint_polygons
+        )
+        return _MissingCandidate(
+            alert,
+            distance_ratio,
+            pixel_ratio,
+            measurement_conflict,
+            position_conflict,
         )
 
     @staticmethod
@@ -359,45 +460,64 @@ class GapThresholdTracker:
     def _vote(
         self,
         gap: _StableGapState,
-        candidate: MissingAlert | None,
+        candidate: _MissingCandidate | None,
         *,
         allowed: bool,
         can_activate: bool,
     ) -> None:
         if not allowed:
-            gap.votes.clear()
-            gap.active = False
-            gap.normal_streak = 0
-            gap.last_alert = None
+            self._reset_gap_level(gap)
             return
         if gap.cooldown_remaining > 0:
             gap.cooldown_remaining -= 1
-            gap.votes.clear()
-            gap.active = False
-            gap.normal_streak = 0
-            gap.last_alert = None
+            self._reset_gap_level(gap)
             return
 
         positive = candidate is not None
         gap.votes.append(positive)
         if positive:
-            gap.last_alert = candidate
+            gap.last_alert = candidate.alert
             gap.normal_streak = 0
-        elif gap.active:
+            if candidate.credible and candidate.distance_ratio >= self.alert_ratio:
+                gap.strong_alert_streak += 1
+            else:
+                gap.strong_alert_streak = 0
+        else:
             gap.normal_streak += 1
+            gap.strong_alert_streak = 0
 
         if (
-            not gap.active
+            gap.level == "normal"
             and can_activate
             and sum(gap.votes) >= self.confirm_votes
         ):
-            gap.active = True
-            gap.normal_streak = 0
-        elif gap.active and gap.normal_streak >= self.clear_frames:
-            gap.active = False
-            gap.votes.clear()
-            gap.last_alert = None
-            gap.normal_streak = 0
+            gap.level = "suspect"
+            gap.suspect_frames = 1
+        elif gap.level in {"suspect", "alert"}:
+            gap.suspect_frames += 1
+
+        if (
+            gap.level == "suspect"
+            and candidate is not None
+            and candidate.credible
+            and (
+                gap.strong_alert_streak >= self.alert_confirm_frames
+                or gap.suspect_frames >= self.suspect_frames
+            )
+        ):
+            gap.level = "alert"
+
+        if gap.level != "normal" and gap.normal_streak >= self.clear_frames:
+            self._reset_gap_level(gap)
+
+    @staticmethod
+    def _reset_gap_level(gap: _StableGapState) -> None:
+        gap.votes.clear()
+        gap.level = "normal"
+        gap.suspect_frames = 0
+        gap.strong_alert_streak = 0
+        gap.normal_streak = 0
+        gap.last_alert = None
 
     def update(
         self,
@@ -405,9 +525,13 @@ class GapThresholdTracker:
         tracking: RouteTrackingResult,
         *,
         gap_ratio: float,
+        fallen_indices: Sequence[int] = (),
+        fallen_stable_ids: dict[int, int] | None = None,
     ) -> GapTrackingResult:
         if gap_ratio <= 1.0:
             raise ValueError("gap_ratio must be greater than 1")
+        if self.alert_ratio < gap_ratio:
+            raise ValueError("alert_ratio must be greater than or equal to gap_ratio")
         active_ids = {track.stable_id for track in tracking.tracks}
         self._states = {
             stable_id: state
@@ -421,6 +545,15 @@ class GapThresholdTracker:
         }
         alerts: list[MissingAlert] = []
         alert_gap_ids: list[int] = []
+        suspects: list[MissingAlert] = []
+        suspect_gap_ids: list[int] = []
+        suppressed_by_fallen: list[SuppressedMissing] = []
+        fallen_stable_ids = fallen_stable_ids or {}
+        fallen_centers = {
+            index: analysis.ordered[index].center
+            for index in fallen_indices
+            if 0 <= index < len(analysis.ordered)
+        }
         diagnostics: list[GapRouteThreshold] = []
         gap_diagnostics: list[TrackedGap] = []
 
@@ -435,28 +568,78 @@ class GapThresholdTracker:
                 for alert in analysis.missing
                 if alert.after_index in route
             }
+            # Keep the raw candidate in events.jsonl, but prevent this gap
+            # from entering the MISSING state when a confirmed fallen cone is
+            # sitting at one of its expected positions.
+            suppressed_after: set[int] = set()
+            for alert in analysis.missing:
+                if alert.after_index not in route:
+                    continue
+                threshold = max(
+                    20.0,
+                    (state.nominal_gap or alert.reference_gap_pixels) * 0.80,
+                )
+                matching_fallen = tuple(
+                    index
+                    for index, center in fallen_centers.items()
+                    if any(_distance(center, position) <= threshold for position in alert.positions)
+                )
+                if not matching_fallen:
+                    continue
+                suppressed_after.add(alert.after_index)
+                suppressed_by_fallen.append(
+                    SuppressedMissing(
+                        alert=alert,
+                        stable_route_id=track.business_stable_id,
+                        fallen_stable_ids=tuple(
+                            sorted(
+                                fallen_stable_ids[index]
+                                for index in matching_fallen
+                                if index in fallen_stable_ids
+                            )
+                        ),
+                    )
+                )
+            centers = tuple(analysis.ordered[index].center for index in route)
+            cone_ids, affected_keys = self._match_cones(state, centers, track)
+            if affected_keys:
+                state.history_cooldown_remaining = self.membership_cooldown_frames
+            history_in_cooldown = state.history_cooldown_remaining > 0
+            history_update_allowed = (
+                track.alert_ready
+                and len(route) >= self.history_min_cones
+                and not history_in_cooldown
+            )
+            ignored_after_indices = set(analysis.missing_edge_ignored)
+            reliable_gaps = [
+                gap_distance
+                for first_index, _, _, gap_distance in gap_items
+                if first_index not in raw_by_after
+                and first_index not in ignored_after_indices
+            ]
             frame_average, excluded_close = self._update_state(
                 state,
-                [item[3] for item in gap_items],
-                [
-                    alert.reference_gap_corrected
-                    if alert.reference_gap_corrected is not None
-                    else alert.reference_gap_pixels
-                    for alert in raw_by_after.values()
-                ],
+                reliable_gaps,
+                allow_history_update=history_update_allowed,
             )
+            if state.history_cooldown_remaining > 0:
+                state.history_cooldown_remaining -= 1
+
             enough_history = len(state.history) >= self.min_history_frames
             if state.nominal_gap is None and state.history:
                 source = "warming_up"
+            elif state.nominal_gap is None and len(route) < self.history_min_cones:
+                source = "insufficient_cones"
             elif state.nominal_gap is None:
                 source = "insufficient_history"
-            elif enough_history:
-                source = "history"
+            elif history_in_cooldown:
+                source = "frozen_membership_change"
+            elif len(route) < self.history_min_cones:
+                source = "frozen_low_support"
+            elif not track.alert_ready:
+                source = "frozen_unconfirmed_route"
             else:
-                source = "warming_up"
-
-            centers = tuple(analysis.ordered[index].center for index in route)
-            cone_ids, affected_keys = self._match_cones(state, centers, track)
+                source = "history"
             current_keys = {
                 _gap_key(first_id, second_id)
                 for first_id, second_id in zip(cone_ids, cone_ids[1:])
@@ -467,10 +650,7 @@ class GapThresholdTracker:
                     gap_state = self._new_gap_state(key)
                     state.gaps[key] = gap_state
                 gap_state.cooldown_remaining = self.membership_cooldown_frames
-                gap_state.votes.clear()
-                gap_state.active = False
-                gap_state.normal_streak = 0
-                gap_state.last_alert = None
+                self._reset_gap_level(gap_state)
 
             eligible = len(route) >= self.min_alert_cones
             for gap_index, (
@@ -485,38 +665,48 @@ class GapThresholdTracker:
                     gap_state = self._new_gap_state(key)
                     state.gaps[key] = gap_state
                 raw_alert = raw_by_after.get(first_index)
-                provisional_reference = (
-                    state.nominal_gap
-                    or (
-                        raw_alert.reference_gap_corrected
-                        if raw_alert is not None
-                        and raw_alert.reference_gap_corrected is not None
-                        else raw_alert.reference_gap_pixels
-                        if raw_alert is not None
+                if first_index in suppressed_after:
+                    self._vote(
+                        gap_state,
+                        None,
+                        allowed=False,
+                        can_activate=False,
+                    )
+                    candidate = None
+                else:
+                    provisional_reference = (
+                        state.nominal_gap
+                        or (
+                            raw_alert.reference_gap_corrected
+                            if raw_alert is not None
+                            and raw_alert.reference_gap_corrected is not None
+                            else raw_alert.reference_gap_pixels
+                            if raw_alert is not None
+                            else None
+                        )
+                    )
+                    candidate = (
+                        self._candidate_alert(
+                            analysis,
+                            first_index,
+                            second_index,
+                            gap_pixels,
+                            gap_distance,
+                            raw_alert,
+                            provisional_reference,
+                            gap_ratio,
+                        )
+                        if provisional_reference is not None
                         else None
                     )
-                )
-                candidate = (
-                    self._candidate_alert(
-                        analysis,
-                        first_index,
-                        second_index,
-                        gap_pixels,
-                        gap_distance,
-                        raw_alert,
-                        provisional_reference,
-                        gap_ratio,
+                if first_index not in suppressed_after:
+                    self._vote(
+                        gap_state,
+                        candidate,
+                        allowed=track.alert_ready and eligible,
+                        can_activate=enough_history and state.nominal_gap is not None,
                     )
-                    if provisional_reference is not None
-                    else None
-                )
-                self._vote(
-                    gap_state,
-                    candidate,
-                    allowed=track.alert_ready and eligible,
-                    can_activate=enough_history and state.nominal_gap is not None,
-                )
-                if gap_state.active:
+                if gap_state.level != "normal":
                     reference = max(
                         state.nominal_gap or 0.0,
                         self.minimum_gap_pixels
@@ -529,8 +719,9 @@ class GapThresholdTracker:
                         else gap_pixels
                     )
                     alert = (
-                        candidate
-                        or (
+                        candidate.alert
+                        if candidate is not None
+                        else (
                             self._alert_for_gap(
                                 analysis,
                                 first_index,
@@ -545,21 +736,44 @@ class GapThresholdTracker:
                         )
                     )
                     if alert is not None:
-                        alerts.append(alert)
-                        alert_gap_ids.append(gap_state.stable_id)
+                        if gap_state.level == "alert":
+                            alerts.append(alert)
+                            alert_gap_ids.append(gap_state.stable_id)
+                        else:
+                            suspects.append(alert)
+                            suspect_gap_ids.append(gap_state.stable_id)
                 gap_diagnostics.append(
                     TrackedGap(
                         stable_id=gap_state.stable_id,
-                        stable_route_id=track.stable_id,
+                        stable_route_id=track.business_stable_id,
                         after_index=first_index,
                         endpoint_ids=key,
                         candidate_missing=candidate is not None,
-                        active_missing=gap_state.active,
+                        active_missing=gap_state.level == "alert",
                         positive_votes=sum(gap_state.votes),
                         vote_count=len(gap_state.votes),
                         normal_streak=gap_state.normal_streak,
                         cooldown_remaining=gap_state.cooldown_remaining,
                         business_eligible=eligible,
+                        alert_level=gap_state.level,
+                        suspect_frames=gap_state.suspect_frames,
+                        strong_alert_streak=gap_state.strong_alert_streak,
+                        distance_ratio=(
+                            candidate.distance_ratio if candidate is not None else None
+                        ),
+                        pixel_ratio=(
+                            candidate.pixel_ratio if candidate is not None else None
+                        ),
+                        measurement_conflict=(
+                            candidate.measurement_conflict
+                            if candidate is not None
+                            else False
+                        ),
+                        position_conflict=(
+                            candidate.position_conflict
+                            if candidate is not None
+                            else False
+                        ),
                     )
                 )
 
@@ -572,7 +786,7 @@ class GapThresholdTracker:
             }
             diagnostics.append(
                 GapRouteThreshold(
-                    stable_id=track.stable_id,
+                    stable_id=track.business_stable_id,
                     current_route_index=route_index,
                     nominal_gap_pixels=state.nominal_gap,
                     frame_average_pixels=frame_average,
@@ -588,8 +802,21 @@ class GapThresholdTracker:
             )
 
         return GapTrackingResult(
-            tuple(alerts),
-            tuple(diagnostics),
-            tuple(gap_diagnostics),
-            tuple(alert_gap_ids),
+            missing=tuple(alerts),
+            routes=tuple(diagnostics),
+            gaps=tuple(gap_diagnostics),
+            missing_gap_ids=tuple(alert_gap_ids),
+            suspect=tuple(suspects),
+            suspect_gap_ids=tuple(suspect_gap_ids),
+            policy=GapAlertPolicy(
+                suspect_ratio=gap_ratio,
+                alert_ratio=self.alert_ratio,
+                vote_window=self.vote_window,
+                confirm_votes=self.confirm_votes,
+                suspect_frames=self.suspect_frames,
+                alert_confirm_frames=self.alert_confirm_frames,
+                clear_frames=self.clear_frames,
+                max_ratio_disagreement=self.max_ratio_disagreement,
+            ),
+            suppressed_by_fallen=tuple(suppressed_by_fallen),
         )

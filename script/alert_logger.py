@@ -14,17 +14,26 @@ def _current_alerts(event: dict[str, Any]) -> dict[AlertKey, dict[str, Any]]:
     fields = (
         ("stable_missing", "MISSING", "stable_gap_id"),
         ("stable_displaced", "SHIFT", None),
-        ("stable_fallen", "FALLEN", None),
+        ("stable_fallen", "FALLEN", "stable_cone_id"),
     )
     for field, alert_type, identity_field in fields:
         for alert in event.get(field, ()):
             stable_route_id = alert.get("stable_route_id")
-            if stable_route_id is None:
+            identity_id = alert.get(identity_field) if identity_field else None
+            if stable_route_id is None and not (
+                alert_type == "FALLEN" and identity_id is not None
+            ):
                 continue
-            detail_id = (
-                alert.get(identity_field) if identity_field is not None else None
+            # FALLEN identity belongs to the cone tracker, not the adaptive
+            # route.  This keeps a route split/merge from reactivating the
+            # same physical fallen cone.
+            key_id = (
+                int(identity_id)
+                if alert_type == "FALLEN" and identity_id is not None
+                else int(stable_route_id)
             )
-            current[(alert_type, int(stable_route_id), detail_id)] = alert
+            detail_id = None if alert_type == "FALLEN" else identity_id
+            current[(alert_type, key_id, detail_id)] = alert
     return current
 
 
@@ -41,16 +50,20 @@ class AlertJournal:
         current = _current_alerts(event)
         started = sorted(set(current) - self._active)
         records: list[dict[str, Any]] = []
-        for alert_type, stable_route_id, detail_id in started:
+        for alert_type, identity_id, detail_id in started:
             self._count += 1
+            alert = current[(alert_type, identity_id, detail_id)]
+            stable_route_id = alert.get("stable_route_id")
             record: dict[str, Any] = {
                 "alert_count": self._count,
                 "time_seconds": round(float(time_seconds), 3),
-                "roi_id": f"ROI_{stable_route_id}",
+                "roi_id": f"ROI_{stable_route_id or identity_id}",
                 "alert_type": alert_type,
             }
             if alert_type == "MISSING" and detail_id is not None:
                 record["stable_gap_id"] = detail_id
+            if alert_type == "FALLEN":
+                record["stable_cone_id"] = identity_id
             records.append(record)
         self._active = set(current)
         return records

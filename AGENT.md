@@ -46,10 +46,13 @@ index and FPS.
   cone identities across adjacent frames.
 - When a cone enters or leaves a route, suppress the affected adjacent gaps for
   five frames (configurable within the requested three-to-five-frame range).
-- Confirm a candidate alert only after it is positive in at least three of the
-  latest five observations for the same stable gap.
-- Once confirmed, keep the alert active until the same gap has been normal for
-  three consecutive observations.
+- Promote a candidate to yellow suspect only after it is positive in at least
+  three of the latest five observations for the same stable gap.
+- Promote yellow to red only after a credible strong ratio is stable or a
+  credible suspect persists for the configured FPS-derived duration.
+- Keep red active until the same gap has been normal for three consecutive
+  observations. Yellow suspects remain diagnostic and never enter concise
+  business alert logs.
 - Apply the minimum-three-cone business gate after ROI tracking, without
   changing route grouping or ROI drawing.
 - Record only alert activation transitions in the concise alert logs so a
@@ -57,11 +60,11 @@ index and FPS.
 
 ## Oblique drone distance correction
 
-Inference defaults to a flat-ground pinhole projection for a roll-stabilized
-drone camera. The default optical-axis depression is 45 degrees and the default
-horizontal field of view is 84 degrees. Missing-gap ratios and displacement
-rules use projected ground coordinates; route grouping, ROI drawing, and route
-tracking remain in image pixels.
+Inference defaults to pixel distances. Flat-ground pinhole projection is
+enabled only when both camera pitch and the effective horizontal field of view
+are explicitly supplied. Missing-gap ratios and displacement rules then use
+projected ground coordinates; route grouping, ROI drawing, and route tracking
+remain in image pixels.
 
 Pitch alone cannot recover meters. Without camera height, corrected distances
 are expressed in `camera_heights` and are valid for relative gap ratios. With
@@ -139,8 +142,8 @@ conda run -n yolo-obb python script/train_obb.py \
   --device 0
 ```
 
-Drone inference with the default relative 45-degree correction. Distances are
-in `camera_heights` because no measured altitude is supplied:
+Drone inference with explicit relative 45-degree correction. Distances are in
+`camera_heights` because no measured altitude is supplied:
 
 ```bash
 conda run -n yolo-obb python script/infer_obb.py \

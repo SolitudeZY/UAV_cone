@@ -1,0 +1,4 @@
+interface:
+  display_name: "CVAT Nuclio Model Deployment"
+  short_description: "Deploy and verify ONNX detectors on CVAT Nuclio"
+  default_prompt: "Use $cvat-nuclio-model-deployment to deploy and validate this ONNX detector on my CVAT platform."

@@ -17,7 +17,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--data",
         type=Path,
-        default=project_root / "dataset" / "2026-07-15" / "data.yaml",
+        default=project_root / "dataset" / "2026-08-05-merged-3class" / "data.yaml",
     )
     parser.add_argument("--model", default="yolov8s-obb.pt", help="Initial weights or model YAML")
     parser.add_argument("--epochs", type=int, default=150)
@@ -27,9 +27,49 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--patience", type=int, default=30)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--optimizer",
+        default="auto",
+        help="Ultralytics optimizer name; use AdamW with a small --lr0 for incremental tuning",
+    )
+    parser.add_argument("--lr0", type=float, default=0.01, help="Initial learning rate")
+    parser.add_argument("--lrf", type=float, default=0.01, help="Final learning-rate factor")
+    parser.add_argument("--warmup-epochs", type=float, default=3.0)
+    parser.add_argument(
+        "--freeze",
+        type=int,
+        default=0,
+        help="Freeze the first N model layers; 10 is useful for small hard-negative updates",
+    )
+    parser.add_argument(
+        "--save-period",
+        type=int,
+        default=-1,
+        help="Save an epoch checkpoint every N epochs; -1 keeps only best/last",
+    )
     parser.add_argument("--cache", action="store_true", help="Cache training images in RAM")
+    parser.add_argument(
+        "--degrees", type=float, default=15.0,
+        help="Limited rotation augmentation for drone yaw changes",
+    )
+    parser.add_argument(
+        "--scale", type=float, default=0.5,
+        help="Moderate scale augmentation for focal-length/FOV variation",
+    )
+    parser.add_argument(
+        "--perspective", type=float, default=0.0002,
+        help="Very small perspective augmentation; avoids distorting cone geometry",
+    )
+    parser.add_argument(
+        "--shear", type=float, default=2.0,
+        help="Small shear augmentation for view variation",
+    )
+    parser.add_argument(
+        "--mosaic", type=float, default=0.3,
+        help="Limited mosaic probability; lower than Ultralytics default for route realism",
+    )
     parser.add_argument("--project", type=Path, default=project_root / "script" / "runs")
-    parser.add_argument("--name", default="traffic_cone_person_vest_yolov8s_obb_960")
+    parser.add_argument("--name", default="traffic_cone_3class_yolov8s_obb_960")
     parser.add_argument(
         "--resume",
         type=Path,
@@ -65,13 +105,24 @@ def create_resolved_data_config(data_path: Path, output_dir: Path) -> Path:
     return resolved_path
 
 
+def resolve_dataset_root(data_path: Path) -> Path:
+    config = yaml.safe_load(data_path.read_text(encoding="utf-8")) or {}
+    configured_root = Path(str(config.get("path", "."))).expanduser()
+    return (
+        configured_root.resolve()
+        if configured_root.is_absolute()
+        else (data_path.parent / configured_root).resolve()
+    )
+
+
 def main() -> int:
     args = build_parser().parse_args()
     data_path = args.data.resolve()
     if not data_path.is_file():
         raise SystemExit(f"Dataset config does not exist: {data_path}")
 
-    report = validate_dataset(data_path.parent)
+    dataset_root = resolve_dataset_root(data_path)
+    report = validate_dataset(dataset_root)
     if report.fatal_issues:
         details = "\n".join(issue.format() for issue in report.fatal_issues[:20])
         raise SystemExit(f"Dataset validation failed:\n{details}")
@@ -79,7 +130,7 @@ def main() -> int:
         print(
             f"WARNING: found {len(report.coordinate_issues)} OBB coordinate rows slightly outside "
             "[0, 1]. Ultralytics may ignore them. Fix with:\n"
-            f"  python script/validate_dataset.py --data-root {data_path.parent} --fix-boundaries"
+            f"  python script/validate_dataset.py --data-root {dataset_root} --fix-boundaries"
         )
 
     YOLO = require_ultralytics()
@@ -95,6 +146,12 @@ def main() -> int:
         "workers": args.workers,
         "patience": args.patience,
         "seed": args.seed,
+        "optimizer": args.optimizer,
+        "lr0": args.lr0,
+        "lrf": args.lrf,
+        "warmup_epochs": args.warmup_epochs,
+        "freeze": args.freeze or None,
+        "save_period": args.save_period,
         "cache": args.cache,
         "project": str(args.project.resolve()),
         "name": args.name,
@@ -102,10 +159,15 @@ def main() -> int:
         "plots": True,
         "amp": True,
         "close_mosaic": 10,
-        "degrees": 10.0,
+        "degrees": args.degrees,
         "translate": 0.1,
-        "scale": 0.4,
+        "scale": args.scale,
+        "perspective": args.perspective,
+        "shear": args.shear,
         "fliplr": 0.5,
+        "mosaic": args.mosaic,
+        "mixup": 0.0,
+        "copy_paste": 0.0,
     }
     if args.device is not None:
         train_args["device"] = args.device

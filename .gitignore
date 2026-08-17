@@ -25,6 +25,7 @@ MANIFEST
 # User specified
 doc/
 script/runs/
+script/archive/
 doc
 script/runs
 

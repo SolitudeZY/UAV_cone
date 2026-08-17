@@ -7,11 +7,75 @@ import statistics
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-from scipy.optimize import linear_sum_assignment
-
 
 Point = tuple[float, float]
 Bounds = tuple[float, float, float, float]
+
+
+def _minimum_cost_assignment(matrix: Sequence[Sequence[float]]) -> tuple[list[int], list[int]]:
+    """Rectangular Hungarian assignment for the small route-cost matrix."""
+    if not matrix or not matrix[0]:
+        return [], []
+    transposed = len(matrix) > len(matrix[0])
+    costs = (
+        [list(row) for row in zip(*matrix)]
+        if transposed
+        else [list(row) for row in matrix]
+    )
+    row_count = len(costs)
+    column_count = len(costs[0])
+    row_potential = [0.0] * (row_count + 1)
+    column_potential = [0.0] * (column_count + 1)
+    matched_row = [0] * (column_count + 1)
+    path = [0] * (column_count + 1)
+    for row in range(1, row_count + 1):
+        matched_row[0] = row
+        minimum = [math.inf] * (column_count + 1)
+        used = [False] * (column_count + 1)
+        column = 0
+        while True:
+            used[column] = True
+            current_row = matched_row[column]
+            delta = math.inf
+            next_column = 0
+            for candidate in range(1, column_count + 1):
+                if used[candidate]:
+                    continue
+                reduced = (
+                    costs[current_row - 1][candidate - 1]
+                    - row_potential[current_row]
+                    - column_potential[candidate]
+                )
+                if reduced < minimum[candidate]:
+                    minimum[candidate] = reduced
+                    path[candidate] = column
+                if minimum[candidate] < delta:
+                    delta = minimum[candidate]
+                    next_column = candidate
+            for candidate in range(column_count + 1):
+                if used[candidate]:
+                    row_potential[matched_row[candidate]] += delta
+                    column_potential[candidate] -= delta
+                else:
+                    minimum[candidate] -= delta
+            column = next_column
+            if matched_row[column] == 0:
+                break
+        while True:
+            previous = path[column]
+            matched_row[column] = matched_row[previous]
+            column = previous
+            if column == 0:
+                break
+    pairs = [
+        (row - 1, column - 1)
+        for column, row in enumerate(matched_row[1:], start=1)
+        if row
+    ]
+    if transposed:
+        pairs = [(column, row) for row, column in pairs]
+    pairs.sort()
+    return [row for row, _ in pairs], [column for _, column in pairs]
 
 
 def _distance(first: Point, second: Point) -> float:
@@ -137,6 +201,7 @@ class RouteObservation:
 @dataclass(frozen=True)
 class TrackedRoute:
     stable_id: int
+    parent_stable_id: int
     state: str
     roi: Bounds
     raw_roi: Bounds | None
@@ -158,6 +223,11 @@ class TrackedRoute:
         return _bounds_center(self.roi)
 
     @property
+    def business_stable_id(self) -> int:
+        """Identity shared by route children created during a split."""
+        return self.parent_stable_id
+
+    @property
     def raw_centroid(self) -> Point | None:
         return _bounds_center(self.raw_roi) if self.raw_roi is not None else None
 
@@ -172,6 +242,7 @@ class RouteTrackingResult:
 @dataclass
 class _TrackState:
     stable_id: int
+    parent_stable_id: int
     state: str
     roi: Bounds
     raw_roi: Bounds | None
@@ -277,7 +348,15 @@ class RouteTracker:
             min(_distance(predicted, center) for center in observation.centers)
             for predicted in predicted_centers
         )
-        nearest_distance = max(candidate_to_track, track_to_candidate)
+        # A route can briefly lose one or more cones (or gain a duplicate
+        # detection) while the underlying route is still the same.  The
+        # symmetric max() cost rejected those partial overlaps and created a
+        # fresh stable ID.  Require both directions to remain bounded, but let
+        # the smaller covered direction dominate the identity cost.
+        nearest_distance = min(candidate_to_track, track_to_candidate)
+        coverage_penalty = abs(
+            len(observation.centers) - len(predicted_centers)
+        ) / max(1, max(len(observation.centers), len(predicted_centers)))
         direction_difference = _axis_difference(track.direction, observation.direction)
         if nearest_distance > self.match_distance_ratio * scale:
             return math.inf
@@ -287,10 +366,11 @@ class RouteTracker:
             _bounds_center(predicted_bounds), observation.centroid
         )
         return (
-            0.50 * nearest_distance / scale
+            0.45 * nearest_distance / scale
             + 0.25 * centroid_distance / (scale * 2.0)
             + 0.15 * direction_difference / max(1.0, self.max_direction_difference)
             + 0.10 * (1.0 - _bounds_iou(predicted_bounds, observation.bounds))
+            + 0.05 * coverage_penalty
         )
 
     def _assign(self, observations: Sequence[RouteObservation]) -> dict[int, int]:
@@ -308,7 +388,7 @@ class RouteTracker:
             [cost if math.isfinite(cost) else blocked for cost in row]
             for row in costs
         ]
-        track_indices, observation_indices = linear_sum_assignment(matrix)
+        track_indices, observation_indices = _minimum_cost_assignment(matrix)
         return {
             int(track_index): int(observation_index)
             for track_index, observation_index in zip(track_indices, observation_indices)
@@ -399,11 +479,16 @@ class RouteTracker:
         self,
         observation: RouteObservation,
         image_size: tuple[int, int],
+        *,
+        parent_stable_id: int | None = None,
     ) -> _TrackState:
         bounds = _clip_bounds(observation.bounds, image_size)
         state = "confirmed" if self.confirm_frames == 1 else "tentative"
         track = _TrackState(
             stable_id=self._next_id,
+            parent_stable_id=(
+                self._next_id if parent_stable_id is None else parent_stable_id
+            ),
             state=state,
             roi=bounds,
             raw_roi=bounds,
@@ -425,6 +510,17 @@ class RouteTracker:
         self._next_id += 1
         return track
 
+    def _covered_by_observation(
+        self, track: _TrackState, observation: RouteObservation
+    ) -> bool:
+        """Return whether an expanded observation absorbed this route."""
+        scale = max(10.0, track.spacing, observation.spacing)
+        covered = statistics.median(
+            min(_distance(center, candidate) for candidate in observation.centers)
+            for center in track.centers
+        )
+        return covered <= self.match_distance_ratio * scale
+
     def update(
         self,
         observations: Sequence[RouteObservation],
@@ -438,6 +534,15 @@ class RouteTracker:
             track.age += 1
             observation_index = assignments.get(track_index)
             if observation_index is None:
+                # A merge can absorb a route that was independently tracked in
+                # the previous frame.  Retiring it here prevents a duplicate
+                # held ROI and lets the surviving track carry the lineage.
+                if any(
+                    self._covered_by_observation(track, observation)
+                    and len(observation.centers) > len(track.centers)
+                    for observation in observations
+                ):
+                    continue
                 if self._update_missed(track, image_size):
                     retained.append(track)
                 continue
@@ -445,7 +550,17 @@ class RouteTracker:
             retained.append(track)
         for observation_index, observation in enumerate(observations):
             if observation_index not in matched_observations:
-                retained.append(self._new_track(observation, image_size))
+                parent = next(
+                    (
+                        track.parent_stable_id
+                        for track in self._tracks
+                        if self._covered_by_observation(track, observation)
+                    ),
+                    None,
+                )
+                retained.append(
+                    self._new_track(observation, image_size, parent_stable_id=parent)
+                )
         retained.sort(key=lambda track: track.stable_id)
         self._tracks = retained
         return self._snapshot()
@@ -454,6 +569,7 @@ class RouteTracker:
         public_tracks = tuple(
             TrackedRoute(
                 stable_id=track.stable_id,
+                parent_stable_id=track.parent_stable_id,
                 state=track.state,
                 roi=track.roi,
                 raw_roi=track.raw_roi,
@@ -473,7 +589,7 @@ class RouteTracker:
             for track in self._tracks
         )
         route_to_stable_id = {
-            track.current_route_index: track.stable_id
+            track.current_route_index: track.business_stable_id
             for track in public_tracks
             if track.current_route_index is not None
         }
@@ -481,6 +597,6 @@ class RouteTracker:
             tracks=public_tracks,
             route_to_stable_id=route_to_stable_id,
             alertable_stable_ids=frozenset(
-                track.stable_id for track in public_tracks if track.alert_ready
+                track.business_stable_id for track in public_tracks if track.alert_ready
             ),
         )
