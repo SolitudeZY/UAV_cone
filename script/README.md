@@ -98,6 +98,17 @@ route、MISSING、SHIFT、FALLEN 或业务告警，也不计入 `cone_count`。�
 `events.jsonl.detections`，标记为 `postprocess_status: too_small`；每帧排除数量记录在
 `small_cone_suppressed`。传入 `--min-cone-long-side-ratio 0` 可关闭该过滤。
 
+视频推理还会对过滤后的有效锥桶做单目标时序计数。默认最近 5 帧至少命中 3 帧后才确认一个锥桶，确认后的轨迹最多保持 5 个漏检帧；短时漏检恢复时沿用原稳定 ID，不会重复累计。可按视频帧率调整：
+
+```text
+--cone-count-confirm-window 5
+--cone-count-confirm-votes 3
+--cone-count-max-missed-frames 5
+--cone-count-match-distance-ratio 0.8
+```
+
+`events.jsonl` 中保留原始逐帧 `cone_count`，并新增 `stable_visible_count`、`unique_seen_count`、`new_cone_ids`、`active_cone_ids`、`held_cone_ids`、`stable_cone_ids` 和 `tracked_cones`；推理结束另写 `cone_count.json` 保存累计结果。其中 `unique_seen_count` 是本视频累计确认过的稳定锥桶数，标注视频显示稳定 ID 以及 `CONE visible=<n> total=<n>`。累计数是基于稳定轨迹的确认实例数；无人机大幅运动且没有可靠地面/全局运动补偿时，不应把它解释为物理锥桶的绝对总数。
+
 MobileNetV3-small 可直接接入完整业务推理。新权重使用 `1.6x` 候选上下文，阈值文件
 默认从权重同目录的 `thresholds.json` 读取：
 
@@ -199,7 +210,7 @@ python script/infer_obb.py \
   --output script/runs/infer_videos_gap_stable/DJI_1m22s_1m36s
 ```
 
-输出目录包含标注视频 `*_result.mp4`、逐帧诊断 `events.jsonl`、结构化告警激活记录 `alert.jsonl` 和人工复查日志 `alert.log`。同一告警持续多帧时，后两者只在激活瞬间写一条，不会每帧重复。`alert.log` 示例：
+输出目录包含标注视频 `*_result.mp4`、逐帧诊断 `events.jsonl`、锥桶累计结果 `cone_count.json`、结构化告警激活记录 `alert.jsonl` 和人工复查日志 `alert.log`。同一告警持续多帧时，后两者只在激活瞬间写一条，不会每帧重复。`alert.log` 示例：
 
 ```text
 1\ttime=2.500s\troi=ROI_4\ttype=MISSING

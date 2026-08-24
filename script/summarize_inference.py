@@ -35,6 +35,9 @@ def summarize(output: Path) -> dict[str, object]:
         float(item["confidence"]) for item in detections if item.get("label") == "cone"
     ]
     cone_frames = [event for event in events if event.get("cone_count", 0) > 0]
+    stable_cone_frames = [
+        event for event in events if event.get("stable_visible_count", 0) > 0
+    ]
     alert_counts = {
         field: sum(len(event.get(field, [])) for event in events)
         for field in ALERT_FIELDS
@@ -108,6 +111,17 @@ def summarize(output: Path) -> dict[str, object]:
             "confidence_ge_0_5": sum(value >= 0.5 for value in cone_confidences),
             "confidence_ge_0_75": sum(value >= 0.75 for value in cone_confidences),
             "max_per_frame": max((int(event.get("cone_count", 0)) for event in events), default=0),
+            "stable_visible_frames": len(stable_cone_frames),
+            "max_stable_visible": max(
+                (int(event.get("stable_visible_count", 0)) for event in events),
+                default=0,
+            ),
+            "unique_seen_count": int(events[-1].get("unique_seen_count", 0))
+            if events
+            else 0,
+            "new_cone_confirmations": sum(
+                len(event.get("new_cone_ids", [])) for event in events
+            ),
         },
         "raw_and_stable_alert_events": alert_counts,
         "activation_alerts": {

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from alert_logger import AlertJournal, format_review_alert
+from cone_counter import ConeCounter, ConeCountingResult
 from fallen_tracker import ConeTrackRegistry, FallenTrackingResult
 from gap_tracker import GapThresholdTracker, GapTrackingResult
 from ground_projection import GroundPlaneProjector
@@ -242,6 +243,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum long-axis angle change between accepted FALLEN votes",
     )
     parser.add_argument("--fallen-edge-margin", type=float, default=0.05)
+    parser.add_argument(
+        "--cone-count-confirm-window",
+        type=int,
+        default=5,
+        help="Recent observations used to confirm one cone before counting it",
+    )
+    parser.add_argument(
+        "--cone-count-confirm-votes",
+        type=int,
+        default=3,
+        help="Positive observations required within the cone count window",
+    )
+    parser.add_argument(
+        "--cone-count-max-missed-frames",
+        type=int,
+        default=5,
+        help="Keep a confirmed cone track through this many missed frames",
+    )
+    parser.add_argument(
+        "--cone-count-match-distance-ratio",
+        type=float,
+        default=0.8,
+        help="Matching distance as a multiple of local cone spacing",
+    )
     parser.add_argument(
         "--missing-edge-margin",
         type=float,
@@ -625,6 +650,7 @@ def _draw_frame(
     min_alert_cones: int = 3,
     confirmed_shift_route_ids: frozenset[int] | None = None,
     fallen_tracking: FallenTrackingResult | None = None,
+    cone_counting: ConeCountingResult | None = None,
 ) -> Any:
     fallen_indices = {
         observation.index
@@ -710,6 +736,19 @@ def _draw_frame(
             cv2.putText(frame, "FALLEN", (center[0] + 7, center[1] - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
         elif index in displaced_indices:
             cv2.putText(frame, "SHIFT", (center[0] + 7, center[1] - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+        if cone_counting is not None:
+            stable_id = cone_counting.index_to_stable_id.get(index)
+            if stable_id is not None:
+                cv2.putText(
+                    frame,
+                    f"ID {stable_id}",
+                    (center[0] + 7, center[1] + 16),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.42,
+                    color,
+                    1,
+                    cv2.LINE_AA,
+                )
 
     suspect_alerts = gap_tracking.suspect if gap_tracking is not None else ()
     for alert in suspect_alerts:
@@ -732,6 +771,20 @@ def _draw_frame(
             cv2.putText(frame, "MISSING", (center[0] + 10, center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2, cv2.LINE_AA)
     if roi is not None:
         cv2.rectangle(frame, _point((roi[0], roi[1])), _point((roi[2], roi[3])), (255, 255, 0), 2)
+    if cone_counting is not None:
+        cv2.putText(
+            frame,
+            (
+                f"CONE visible={cone_counting.stable_visible_count} "
+                f"total={cone_counting.unique_seen_count}"
+            ),
+            (12, 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
     return frame
 
 
@@ -749,6 +802,7 @@ def _events(
     shift_confirm_frames: int = 1,
     shift_membership_stable_frames: int = 1,
     fallen_tracking: FallenTrackingResult | None = None,
+    cone_counting: ConeCountingResult | None = None,
     small_cone_suppressed: int = 0,
     classifier_policy: dict[str, Any] | None = None,
     classifier_timing_ms: dict[str, float] | None = None,
@@ -862,6 +916,30 @@ def _events(
         "distance_unit": analysis.distance_unit,
         "perspective_calibration": analysis.perspective_calibration,
         "cone_count": len(analysis.ordered),
+        "stable_visible_count": (
+            cone_counting.stable_visible_count if cone_counting is not None else None
+        ),
+        "unique_seen_count": (
+            cone_counting.unique_seen_count if cone_counting is not None else None
+        ),
+        "new_cone_ids": (
+            list(cone_counting.new_cone_ids) if cone_counting is not None else []
+        ),
+        "active_cone_ids": (
+            list(cone_counting.active_cone_ids) if cone_counting is not None else []
+        ),
+        "held_cone_ids": (
+            list(cone_counting.held_cone_ids) if cone_counting is not None else []
+        ),
+        "stable_cone_ids": (
+            list(cone_counting.stable_cone_ids) if cone_counting is not None else []
+        ),
+        "tracked_cones": (
+            list(cone_counting.tracked_cones) if cone_counting is not None else []
+        ),
+        "cone_counting_policy": (
+            cone_counting.policy if cone_counting is not None else None
+        ),
         "roi": roi,
         "person_suppressed": person_suppressed,
         "small_cone_suppressed": small_cone_suppressed,
@@ -1130,6 +1208,17 @@ def main() -> int:
         raise SystemExit(f"Weights do not exist: {args.weights}")
     if not 0.0 <= args.min_cone_long_side_ratio < 1.0:
         raise SystemExit("--min-cone-long-side-ratio must be in [0, 1)")
+    if args.cone_count_confirm_window < 1 or not (
+        1 <= args.cone_count_confirm_votes <= args.cone_count_confirm_window
+    ):
+        raise SystemExit(
+            "--cone-count-confirm-votes must be within "
+            "--cone-count-confirm-window"
+        )
+    if args.cone_count_max_missed_frames < 0:
+        raise SystemExit("--cone-count-max-missed-frames must not be negative")
+    if args.cone_count_match_distance_ratio <= 0.0:
+        raise SystemExit("--cone-count-match-distance-ratio must be positive")
     if args.classifier_thresholds is not None and args.classifier_weights is None:
         raise SystemExit("--classifier-thresholds requires --classifier-weights")
     ground_projector = _ground_projector_from_args(args)
@@ -1190,6 +1279,7 @@ def main() -> int:
 
     args.output.mkdir(parents=True, exist_ok=True)
     event_path = args.output / "events.jsonl"
+    cone_count_path = args.output / "cone_count.json"
     structured_alert_path = args.output / "alert.jsonl"
     review_alert_path = args.output / "alert.log"
     source_path = Path(args.source)
@@ -1238,6 +1328,16 @@ def main() -> int:
         if route_tracker is not None
         else None
     )
+    cone_counter = ConeCounter(
+        confirm_window=(args.cone_count_confirm_window if is_video else 1),
+        confirm_votes=(
+            min(args.cone_count_confirm_votes, args.cone_count_confirm_window)
+            if is_video
+            else 1
+        ),
+        max_missed_frames=args.cone_count_max_missed_frames,
+        match_distance_ratio=args.cone_count_match_distance_ratio,
+    )
     fallen_tracker = ConeTrackRegistry(
         vote_window=args.fallen_vote_window,
         confirm_votes=args.fallen_confirm_votes,
@@ -1257,6 +1357,7 @@ def main() -> int:
     structured_alert_file = structured_alert_path.open("w", encoding="utf-8")
     review_alert_file = review_alert_path.open("w", encoding="utf-8")
     alert_journal = AlertJournal()
+    last_cone_counting: ConeCountingResult | None = None
     try:
         for frame_index, result in enumerate(model.predict(**predict_args)):
             video_time_seconds = (
@@ -1329,6 +1430,8 @@ def main() -> int:
                 if route_tracker is not None
                 else None
             )
+            cone_counting = cone_counter.update(analysis)
+            last_cone_counting = cone_counting
             fallen_tracking = fallen_tracker.update(analysis, tracking)
             active_fallen_indices = tuple(
                 observation.index for observation in fallen_tracking.active
@@ -1387,6 +1490,7 @@ def main() -> int:
                 args.min_alert_cones,
                 confirmed_shift_route_ids,
                 fallen_tracking,
+                cone_counting,
             )
             event = _events(
                 frame_index,
@@ -1402,6 +1506,7 @@ def main() -> int:
                 args.shift_confirm_frames,
                 args.shift_membership_stable_frames,
                 fallen_tracking,
+                cone_counting=cone_counting,
                 small_cone_suppressed=small_cone_suppressed,
                 classifier_policy=classifier_policy,
                 classifier_timing_ms=(
@@ -1462,6 +1567,32 @@ def main() -> int:
     print(f"Inference events: {event_path}")
     print(f"Structured alerts: {structured_alert_path}")
     print(f"Review alerts: {review_alert_path}")
+    if last_cone_counting is not None:
+        cone_count_path.write_text(
+            json.dumps(
+                {
+                    "unique_seen_count": last_cone_counting.unique_seen_count,
+                    "last_stable_visible_count": (
+                        last_cone_counting.stable_visible_count
+                    ),
+                    "last_active_cone_ids": list(
+                        last_cone_counting.active_cone_ids
+                    ),
+                    "last_held_cone_ids": list(last_cone_counting.held_cone_ids),
+                    "counting_policy": last_cone_counting.policy,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        print(
+            "Cone counting: "
+            f"stable_visible={last_cone_counting.stable_visible_count} "
+            f"unique_seen={last_cone_counting.unique_seen_count}"
+        )
+        print(f"Cone count summary: {cone_count_path}")
     if not args.no_save:
         print(f"Annotated output: {args.output}")
     return 0
