@@ -89,6 +89,33 @@ python script/infer_obb.py \
 
 `--source` 可输入单张图片、图片目录、视频、`rtsp://...` 推流地址或摄像头编号 `0`。结果默认保存在 `script/runs/infer/`：图片输出为 `*_result.jpg`，视频输出为 `*_result.mp4`，逐帧结构化结果为 `events.jsonl`。
 
+视频推理默认启用运动补偿后的物理锥桶 ID 计数和稳定 ROI。该模式只替换计数与 ROI 绘制的数据源，`FALLEN / SHIFT / MISSING` 仍使用原有路线跟踪和告警状态机：
+
+```bash
+python script/infer_obb.py \
+  --weights script/runs/traffic_cone_uav_20260814_no_tiny_s_full_1280/weights/best.pt \
+  --source script/test-video/test_10s.mp4 \
+  --imgsz 1280 \
+  --device 0 \
+  --output script/runs/infer_physical_roi/test_10s
+```
+
+默认物理跟踪使用最近 5 帧至少 3 次观察确认、最多保持 12 个漏检帧和 55 像素参考平面匹配距离。检测采用双阈值：`--conf 0.25` 是新建物理 ID、确认 tentative ID 和进入 `FALLEN / SHIFT / MISSING` 的高阈值；`--physical-match-conf 0.20` 是低阈值，只允许重新匹配已经 `confirmed/held` 的物理 ID。未匹配的低阈值候选不会创建 ID、不会计数、不会进入异常检测，也不会绘制；成功恢复时显示 `RECOVER P<ID>`。`physical-match-conf` 必须小于或等于 `conf`。
+
+物理 ROI 在运动补偿后的参考平面中按路线分组：候选成员需要具有相近主方向，同时满足法向距离不超过典型间距的 `0.6` 倍；沿主方向排序后，相邻锥桶距离超过组内最近邻间距中位数的 `2.5` 倍会强制拆组。稳定 ROI 重新关联时，共享物理 ID 在参考平面中的位移也必须通过相同的横向/纵向距离限制。因此平行分离的锥桶列和同方向但距离很远的两批锥桶都不会合并。每组至少 2 个锥桶并连续 3 帧确认，边界使用 `0.25` EMA，漏检显示保持 8 帧，后台 `roi_id` 身份记忆 30 帧。需要 A/B 回归时传入 `--no-physical-roi`，可回退原有图像坐标计数和路线 ROI。
+
+只比较旧图像坐标计数和新物理 ID 计数、不运行异常检测时，可使用独立入口；它使用相同的 `0.25/0.20` 双阈值策略：
+
+```bash
+python script/uav_physical_cone_counter.py \
+  --weights script/runs/traffic_cone_uav_20260814_no_tiny_s_full_1280/weights/best.pt \
+  --source script/test-video/test_10s.mp4 \
+  --imgsz 1280 --device 0 \
+  --output script/runs/uav_physical_dual_conf/test_10s
+```
+
+标注视频中的绿色 OBB 是当前帧模型检测框，`P<ID>` 是统一物理 ID，青色 `PHYSICAL ROI <id>` 是一条物理路线的稳定区域；并列路线分别显示不同的 ROI ID。当前帧漏检但仍在保持窗口内的物理 ID 使用橙色叉号和 `HOLD` 标记，不再额外绘制重复的绿色方框或圆圈。分组参数可用 `--physical-roi-min-cones`、`--physical-roi-confirm-frames`、`--physical-roi-lateral-ratio`、`--physical-roi-link-ratio`、`--physical-roi-max-angle` 和 `--physical-roi-identity-memory-frames` 调整，实际值会写入 `run_config.json`。
+
 三分类模型默认使用同一次前向中的 `person` 框抑制人体区域内的假锥桶，不需要二阶段人员模型，也不会产生第二次完整推理的 FPS 开销。需要关闭时传入 `--exclude-classes ''`。使用历史四分类权重时可显式传入 `--exclude-classes person,vest`。
 
 过小锥桶默认在空间和时序规则之前排除：`--min-cone-long-side-ratio 0.022222`
@@ -97,6 +124,12 @@ python script/infer_obb.py \
 route、MISSING、SHIFT、FALLEN 或业务告警，也不计入 `cone_count`。原始检测保留在
 `events.jsonl.detections`，标记为 `postprocess_status: too_small`；每帧排除数量记录在
 `small_cone_suppressed`。传入 `--min-cone-long-side-ratio 0` 可关闭该过滤。
+
+物理 ID 默认对尺寸过滤增加一条独立放行规则：`--physical-small-cone-conf 0.30`
+表示尺寸不足但置信度达到 0.30 的候选可以只进入物理 ID 跟踪；它们仍不进入
+`FALLEN / SHIFT / MISSING`、普通 route 或普通计数。未匹配的小目标继续保持
+`too_small` 并不绘制，匹配成功后标记为 `physical_small_matched`。该阈值必须不低于
+`--conf`，用于避免用弱小框创建新物理目标。
 
 视频推理还会对过滤后的有效锥桶做单目标时序计数。默认最近 5 帧至少命中 3 帧后才确认一个锥桶，确认后的轨迹最多保持 5 个漏检帧；短时漏检恢复时沿用原稳定 ID，不会重复累计。可按视频帧率调整：
 
@@ -187,6 +220,8 @@ FALLEN 使用单锥桶稳定 ID 做独立时序确认，默认参数如下：
 - `--fallen-max-angle-jump 20`：相邻有效倒伏票的 OBB 长轴角度变化不超过 20 度，角度按 180 度等价计算。
 - `--fallen-reactivation-cooldown-frames 30`：告警解除后，同一稳定锥桶 30 帧内不重复激活。
 
+消融实验可以显式退化或关闭 FALLEN 时序：`--fallen-vote-window 1 --fallen-confirm-votes 1 --fallen-clear-frames 1 --fallen-max-missed-frames 0 --fallen-reactivation-cooldown-frames 0` 表示逐帧基线；完整策略使用默认的 `7/5/3/5/30`。`--no-fallen-missing-suppression` 用于关闭“已确认倒伏锥桶占据预期位置时抑制 MISSING”的跨异常互斥规则。
+
 上述策略只收紧稳定 `FALLEN` 告警，原始逐帧 `fallen` 仍保留在 `events.jsonl`，实际参数记录在 `fallen_alert_policy`。SHIFT 拐点逻辑不修改 `MISSING/FALLEN` 的空间判定。直线中单个锥桶横移时，两侧臂方向仍近似平行，
 不会满足拐点角度条件，因此仍会报告 SHIFT。
 
@@ -210,7 +245,7 @@ python script/infer_obb.py \
   --output script/runs/infer_videos_gap_stable/DJI_1m22s_1m36s
 ```
 
-输出目录包含标注视频 `*_result.mp4`、逐帧诊断 `events.jsonl`、锥桶累计结果 `cone_count.json`、结构化告警激活记录 `alert.jsonl` 和人工复查日志 `alert.log`。同一告警持续多帧时，后两者只在激活瞬间写一条，不会每帧重复。`alert.log` 示例：
+输出目录包含标注视频 `*_result.mp4`、逐帧诊断 `events.jsonl`、锥桶累计结果 `cone_count.json`、本次运行完整参数与权重/视频 SHA-256 的 `run_config.json`、结构化告警激活记录 `alert.jsonl` 和人工复查日志 `alert.log`。同一告警持续多帧时，后两者只在激活瞬间写一条，不会每帧重复。`alert.log` 示例：
 
 ```text
 1\ttime=2.500s\troi=ROI_4\ttype=MISSING
@@ -220,6 +255,8 @@ python script/infer_obb.py \
 
 - `adaptive_routes` 是当前帧的原始空间分组，包含 `route_id`、`stable_route_id`、原始 ROI 和成员中心点。
 - `tracked_routes` 是时序结果，包含稳定 ID、`tentative/confirmed/held` 状态、平滑 ROI、原始 ROI、速度、命中数、丢失帧数和 `alert_ready`。
+- `physical_roi.rois` 是默认物理模式的分组结果，包含稳定 `roi_id`、成员物理 ID、保持成员、参考平面主方向、状态和图像边界；它只用于计数与绘制，不改变异常检测路线。
+- `classifier_counts.physical_small_candidates` 和 `physical_small_matched` 分别记录尺寸过滤但达到放行阈值的小目标数，以及其中已绑定物理 ID 的数量。
 - `gap_thresholds` 按稳定 ROI 输出历史基准、当前帧均值、历史均值、距离单位、置信度、被排除的近距样本和阈值来源；透视模式使用 `*_corrected` 字段，旧像素模式使用 `*_pixels` 字段。
 - `tracked_gaps` 包含稳定 gap ID、`normal/suspect/alert` 状态、倍率、投票、持续帧数和测量冲突原因。
 - `missing_edge_ignored` 列出因路线外端点接近画面边缘而停止判断的 gap 起始索引。

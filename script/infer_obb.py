@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import sys
 import time
 from pathlib import Path
 from typing import Any, Sequence
@@ -22,6 +24,13 @@ from route_tracker import (
 )
 from shift_tracker import ShiftTracker
 from traffic_rules import AnalysisResult, ConeDetection, MissingAlert, analyze_cones
+from uav_physical_cone_counter import (
+    GroundMotionEstimator,
+    PhysicalCountResult,
+    PhysicalRoiResult,
+    PhysicalRoiTracker,
+    UavPhysicalCounter,
+)
 
 
 VIDEO_SUFFIXES = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".webm"}
@@ -44,6 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weights", type=Path, required=True, help="Path to best.pt or last.pt")
     parser.add_argument("--source", required=True, help="Image, directory, video, stream URL, or camera index")
     parser.add_argument("--output", type=Path, default=project_root / "script" / "runs" / "infer")
+    parser.add_argument(
+        "--experiment-name",
+        default=None,
+        help="Optional ablation group name recorded in run_config.json",
+    )
     parser.add_argument("--imgsz", type=int, default=1280)
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--iou", type=float, default=0.5)
@@ -170,6 +184,44 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--roi-max-smoothing", type=float, default=0.75)
     parser.add_argument("--no-temporal-roi", action="store_true")
     parser.add_argument(
+        "--physical-roi",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use UAV motion-compensated physical IDs for video counting and ROI "
+            "drawing; use --no-physical-roi for the legacy image-space mode"
+        ),
+    )
+    parser.add_argument("--physical-max-missed-frames", type=int, default=12)
+    parser.add_argument("--physical-match-distance", type=float, default=55.0)
+    parser.add_argument(
+        "--physical-match-conf",
+        type=float,
+        default=0.20,
+        help=(
+            "Low confidence floor used only to rematch confirmed physical IDs; "
+            "--conf remains the new-ID and anomaly threshold"
+        ),
+    )
+    parser.add_argument(
+        "--physical-small-cone-conf",
+        type=float,
+        default=0.30,
+        help=(
+            "Allow too-small cone candidates at this confidence into physical "
+            "ID tracking only; they remain excluded from anomaly analysis"
+        ),
+    )
+    parser.add_argument("--physical-roi-smoothing", type=float, default=0.25)
+    parser.add_argument("--physical-roi-padding", type=float, default=24.0)
+    parser.add_argument("--physical-roi-hold-frames", type=int, default=8)
+    parser.add_argument("--physical-roi-confirm-frames", type=int, default=3)
+    parser.add_argument("--physical-roi-min-cones", type=int, default=2)
+    parser.add_argument("--physical-roi-lateral-ratio", type=float, default=0.6)
+    parser.add_argument("--physical-roi-link-ratio", type=float, default=2.5)
+    parser.add_argument("--physical-roi-max-angle", type=float, default=20.0)
+    parser.add_argument("--physical-roi-identity-memory-frames", type=int, default=30)
+    parser.add_argument(
         "--camera-pitch-deg",
         type=float,
         default=None,
@@ -231,6 +283,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="FALLEN votes required after the complete vote window is observed",
     )
     parser.add_argument(
+        "--fallen-clear-frames",
+        type=int,
+        default=3,
+        help="Normal observations required to clear a confirmed FALLEN track",
+    )
+    parser.add_argument(
+        "--fallen-max-missed-frames",
+        type=int,
+        default=5,
+        help="Keep a confirmed FALLEN track through this many missed frames",
+    )
+    parser.add_argument(
         "--fallen-match-distance-ratio",
         type=float,
         default=0.6,
@@ -243,6 +307,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum long-axis angle change between accepted FALLEN votes",
     )
     parser.add_argument("--fallen-edge-margin", type=float, default=0.05)
+    parser.add_argument(
+        "--no-fallen-missing-suppression",
+        action="store_true",
+        help="Do not suppress a MISSING gap occupied by a confirmed FALLEN cone",
+    )
     parser.add_argument(
         "--cone-count-confirm-window",
         type=int,
@@ -363,14 +432,19 @@ def _inside_any_box(
 
 
 def _same_model_exclusion_boxes(
-    result: Any, excluded_classes: set[str]
+    result: Any,
+    excluded_classes: set[str],
+    minimum_confidence: float = 0.0,
 ) -> list[tuple[float, float, float, float]]:
     if not excluded_classes or result.obb is None or len(result.obb) == 0:
         return []
     polygons = result.obb.xyxyxyxy.detach().cpu().numpy()
+    confidences = result.obb.conf.detach().cpu().numpy()
     class_ids = result.obb.cls.detach().cpu().numpy().astype(int)
     boxes: list[tuple[float, float, float, float]] = []
-    for polygon, class_id in zip(polygons, class_ids):
+    for polygon, confidence, class_id in zip(polygons, confidences, class_ids):
+        if float(confidence) < minimum_confidence:
+            continue
         if _class_name(result.names, int(class_id)) not in excluded_classes:
             continue
         boxes.append(
@@ -394,20 +468,43 @@ def _extract_detections(
     candidate_classifier: Any | None = None,
     frame: Any | None = None,
     classifier_mode: str = "full",
-) -> tuple[list[ConeDetection], list[dict[str, Any]], int, int]:
+    primary_confidence: float = 0.0,
+    physical_small_cone_conf: float = 1.0,
+) -> tuple[
+    list[ConeDetection],
+    list[ConeDetection],
+    list[dict[str, Any]],
+    int,
+    int,
+]:
     if not 0.0 <= min_cone_long_side_ratio < 1.0:
         raise ValueError("min_cone_long_side_ratio must be in [0, 1)")
     if classifier_mode not in {"audit", "fallen", "full"}:
         raise ValueError("classifier_mode must be audit, fallen, or full")
+    if not 0.0 <= primary_confidence <= 1.0:
+        raise ValueError("primary_confidence must be in [0, 1]")
+    if not 0.0 <= physical_small_cone_conf <= 1.0:
+        raise ValueError("physical_small_cone_conf must be in [0, 1]")
+    if physical_small_cone_conf < primary_confidence:
+        raise ValueError(
+            "physical_small_cone_conf must be at least primary_confidence"
+        )
     if candidate_classifier is not None and frame is None:
         raise ValueError("frame is required when candidate classification is enabled")
     cones: list[ConeDetection] = []
+    physical_candidates: list[ConeDetection] = []
     all_detections: list[dict[str, Any]] = []
     person_suppressed = 0
     small_cone_suppressed = 0
     obb = result.obb
     if obb is None or len(obb) == 0:
-        return cones, all_detections, person_suppressed, small_cone_suppressed
+        return (
+            cones,
+            physical_candidates,
+            all_detections,
+            person_suppressed,
+            small_cone_suppressed,
+        )
     minimum_long_side = (
         min(image_size) * min_cone_long_side_ratio
         if image_size is not None
@@ -438,17 +535,27 @@ def _extract_detections(
                 continue
             item["long_side_pixels"] = cone.long_axis_length
             item["minimum_long_side_pixels"] = minimum_long_side
-            item["postprocess_status"] = "accepted"
+            item["postprocess_status"] = (
+                "accepted"
+                if cone.confidence >= primary_confidence
+                else "physical_recovery_candidate"
+            )
             if cone.long_axis_length < minimum_long_side:
                 item["postprocess_status"] = "too_small"
                 small_cone_suppressed += 1
-                prepared.append((item, None))
+                if cone.confidence >= physical_small_cone_conf:
+                    item["physical_only"] = True
+                    prepared.append((item, cone))
+                else:
+                    prepared.append((item, None))
                 continue
             prepared.append((item, cone))
-            if candidate_classifier is not None:
+            if candidate_classifier is not None and not item.get("physical_only"):
                 review_record_indices.append(len(prepared) - 1)
                 review_polygons.append(polygon_array)
         else:
+            if float(confidence) < primary_confidence:
+                item["postprocess_status"] = "below_primary_confidence"
             prepared.append((item, None))
 
     reviews_by_record: dict[int, dict[str, Any]] = {}
@@ -503,8 +610,19 @@ def _extract_detections(
             if roi is None or (
                 roi[0] <= center_x <= roi[2] and roi[1] <= center_y <= roi[3]
             ):
-                cones.append(cone)
-    return cones, all_detections, person_suppressed, small_cone_suppressed
+                physical_candidates.append(cone)
+                if (
+                    cone.confidence >= primary_confidence
+                    and not item.get("physical_only", False)
+                ):
+                    cones.append(cone)
+    return (
+        cones,
+        physical_candidates,
+        all_detections,
+        person_suppressed,
+        small_cone_suppressed,
+    )
 
 
 def _point(point: tuple[float, float]) -> tuple[int, int]:
@@ -598,14 +716,31 @@ def _draw_detections(
     detections: Sequence[dict[str, Any]],
 ) -> Any:
     for item in detections:
+        if item.get("postprocess_status") in {
+            "below_primary_confidence",
+            "physical_recovery_candidate",
+        }:
+            continue
         polygon = np.asarray(item["polygon"], dtype=np.int32).reshape((-1, 1, 2))
-        if item.get("postprocess_status") == "too_small":
+        if item.get("postprocess_status") == "physical_small_matched":
+            color = (80, 220, 80)
+            caption = (
+                f"SMALL P{item['physical_id']} "
+                f"{item['confidence']:.2f}"
+            )
+        elif item.get("postprocess_status") == "too_small":
             color = (160, 160, 160)
             caption = "SMALL"
         elif item.get("postprocess_status") == "classifier_not_cone":
             color = (0, 165, 255)
             probability = item["classifier"]["probabilities"]["not_cone"]
             caption = f"REJECT N={probability:.2f}"
+        elif item.get("postprocess_status") == "physical_recovery_matched":
+            color = (80, 220, 80)
+            caption = (
+                f"RECOVER P{item['physical_id']} "
+                f"{item['confidence']:.2f}"
+            )
         else:
             color = (255, 180, 0) if item["label"] != "cone" else (50, 210, 50)
             caption = f"{item['label']} {item['confidence']:.2f}"
@@ -651,6 +786,8 @@ def _draw_frame(
     confirmed_shift_route_ids: frozenset[int] | None = None,
     fallen_tracking: FallenTrackingResult | None = None,
     cone_counting: ConeCountingResult | None = None,
+    physical_counting: PhysicalCountResult | None = None,
+    physical_roi: PhysicalRoiResult | None = None,
 ) -> Any:
     fallen_indices = {
         observation.index
@@ -674,7 +811,9 @@ def _draw_frame(
     _draw_detections(cv2, np, frame, detections)
 
     route_colors = ((0, 220, 255), (255, 80, 80), (80, 255, 120), (255, 120, 255))
-    if tracking is None:
+    if physical_counting is not None:
+        drawable_routes = []
+    elif tracking is None:
         drawable_routes = [
             (route_id + 1, "confirmed", _route_bounds(analysis, route), route)
             for route_id, route in enumerate(analysis.routes)
@@ -736,7 +875,7 @@ def _draw_frame(
             cv2.putText(frame, "FALLEN", (center[0] + 7, center[1] - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
         elif index in displaced_indices:
             cv2.putText(frame, "SHIFT", (center[0] + 7, center[1] - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
-        if cone_counting is not None:
+        if cone_counting is not None and physical_counting is None:
             stable_id = cone_counting.index_to_stable_id.get(index)
             if stable_id is not None:
                 cv2.putText(
@@ -769,9 +908,73 @@ def _draw_frame(
             center = _point(position)
             cv2.circle(frame, center, 9, (0, 0, 255), 2, cv2.LINE_AA)
             cv2.putText(frame, "MISSING", (center[0] + 10, center[1]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2, cv2.LINE_AA)
-    if roi is not None:
+    if physical_counting is not None:
+        physical_tracks = {
+            track.physical_id: track
+            for track in physical_counting.tracks
+            if track.state in {"confirmed", "held"}
+        }
+        for physical_id, track in physical_tracks.items():
+            center = _point(track.image_point)
+            held = track.state == "held"
+            color = (0, 165, 255) if held else (0, 255, 0)
+            if held:
+                cv2.drawMarker(
+                    frame,
+                    center,
+                    color,
+                    cv2.MARKER_TILTED_CROSS,
+                    8,
+                    1,
+                    cv2.LINE_AA,
+                )
+            cv2.putText(
+                frame,
+                f"P{physical_id}{' HOLD' if held else ''}",
+                (center[0] + 7, center[1] - 7),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+        for route_roi in physical_roi.rois if physical_roi is not None else ():
+            bounds = route_roi.bounds
+            cv2.rectangle(
+                frame,
+                _point((bounds[0], bounds[1])),
+                _point((bounds[2], bounds[3])),
+                (255, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                frame,
+                f"PHYSICAL ROI {route_roi.roi_id}{' HOLD' if route_roi.state == 'held' else ''}",
+                _point((bounds[0], max(18.0, bounds[1] - 6.0))),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 0),
+                1,
+                cv2.LINE_AA,
+            )
+    elif roi is not None:
         cv2.rectangle(frame, _point((roi[0], roi[1])), _point((roi[2], roi[3])), (255, 255, 0), 2)
-    if cone_counting is not None:
+    if physical_counting is not None:
+        cv2.putText(
+            frame,
+            (
+                f"PHYSICAL visible={physical_counting.stable_visible_count} "
+                f"total={physical_counting.unique_seen_count}"
+            ),
+            (12, 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+    elif cone_counting is not None:
         cv2.putText(
             frame,
             (
@@ -803,6 +1006,10 @@ def _events(
     shift_membership_stable_frames: int = 1,
     fallen_tracking: FallenTrackingResult | None = None,
     cone_counting: ConeCountingResult | None = None,
+    physical_counting: PhysicalCountResult | None = None,
+    physical_roi: PhysicalRoiResult | None = None,
+    ordered_physical_ids: tuple[int | None, ...] = (),
+    fallen_missing_suppression: bool = True,
     small_cone_suppressed: int = 0,
     classifier_policy: dict[str, Any] | None = None,
     classifier_timing_ms: dict[str, float] | None = None,
@@ -916,29 +1123,144 @@ def _events(
         "distance_unit": analysis.distance_unit,
         "perspective_calibration": analysis.perspective_calibration,
         "cone_count": len(analysis.ordered),
+        "counting_mode": (
+            "uav_physical_id" if physical_counting is not None else "image_space"
+        ),
         "stable_visible_count": (
-            cone_counting.stable_visible_count if cone_counting is not None else None
+            physical_counting.stable_visible_count
+            if physical_counting is not None
+            else cone_counting.stable_visible_count
+            if cone_counting is not None
+            else None
         ),
         "unique_seen_count": (
-            cone_counting.unique_seen_count if cone_counting is not None else None
+            physical_counting.unique_seen_count
+            if physical_counting is not None
+            else cone_counting.unique_seen_count
+            if cone_counting is not None
+            else None
         ),
         "new_cone_ids": (
-            list(cone_counting.new_cone_ids) if cone_counting is not None else []
+            list(physical_counting.new_physical_ids)
+            if physical_counting is not None
+            else list(cone_counting.new_cone_ids)
+            if cone_counting is not None
+            else []
         ),
         "active_cone_ids": (
-            list(cone_counting.active_cone_ids) if cone_counting is not None else []
+            list(physical_counting.active_physical_ids)
+            if physical_counting is not None
+            else list(cone_counting.active_cone_ids)
+            if cone_counting is not None
+            else []
         ),
         "held_cone_ids": (
-            list(cone_counting.held_cone_ids) if cone_counting is not None else []
+            list(physical_counting.held_physical_ids)
+            if physical_counting is not None
+            else list(cone_counting.held_cone_ids)
+            if cone_counting is not None
+            else []
         ),
         "stable_cone_ids": (
-            list(cone_counting.stable_cone_ids) if cone_counting is not None else []
+            list(ordered_physical_ids)
+            if physical_counting is not None
+            else list(cone_counting.stable_cone_ids)
+            if cone_counting is not None
+            else []
         ),
         "tracked_cones": (
-            list(cone_counting.tracked_cones) if cone_counting is not None else []
+            [
+                {
+                    "stable_id": track.physical_id,
+                    "state": track.state,
+                    "matched": track.missed_frames == 0,
+                    "counted": track.counted,
+                    "hits": track.hits,
+                    "age": track.age,
+                    "missed_frames": track.missed_frames,
+                    "center_x": track.image_point[0],
+                    "center_y": track.image_point[1],
+                }
+                for track in physical_counting.tracks
+            ]
+            if physical_counting is not None
+            else list(cone_counting.tracked_cones)
+            if cone_counting is not None
+            else []
         ),
         "cone_counting_policy": (
-            cone_counting.policy if cone_counting is not None else None
+            physical_counting.policy
+            if physical_counting is not None
+            else cone_counting.policy
+            if cone_counting is not None
+            else None
+        ),
+        "legacy_counting": (
+            {
+                "stable_visible_count": cone_counting.stable_visible_count,
+                "unique_seen_count": cone_counting.unique_seen_count,
+                "new_cone_ids": list(cone_counting.new_cone_ids),
+                "active_cone_ids": list(cone_counting.active_cone_ids),
+                "held_cone_ids": list(cone_counting.held_cone_ids),
+                "stable_cone_ids": list(cone_counting.stable_cone_ids),
+                "tracked_cones": list(cone_counting.tracked_cones),
+                "policy": cone_counting.policy,
+            }
+            if physical_counting is not None and cone_counting is not None
+            else None
+        ),
+        "physical_counting": (
+            {
+                "stable_visible_count": physical_counting.stable_visible_count,
+                "unique_seen_count": physical_counting.unique_seen_count,
+                "new_physical_ids": list(physical_counting.new_physical_ids),
+                "active_physical_ids": list(physical_counting.active_physical_ids),
+                "held_physical_ids": list(physical_counting.held_physical_ids),
+                "detection_to_physical_id": list(
+                    physical_counting.detection_to_physical_id
+                ),
+                "tracking_degraded": physical_counting.tracking_degraded,
+                "recovery_detection_indices": list(
+                    physical_counting.recovery_detection_indices
+                ),
+                "recovery_physical_ids": [
+                    physical_counting.detection_to_physical_id[index]
+                    for index in physical_counting.recovery_detection_indices
+                ],
+                "tracks": [
+                    {
+                        "physical_id": track.physical_id,
+                        "map_point": track.map_point,
+                        "image_point": track.image_point,
+                        "state": track.state,
+                        "age": track.age,
+                        "hits": track.hits,
+                        "missed_frames": track.missed_frames,
+                        "counted": track.counted,
+                    }
+                    for track in physical_counting.tracks
+                ],
+                "policy": physical_counting.policy,
+            }
+            if physical_counting is not None
+            else None
+        ),
+        "physical_roi": (
+            {
+                "rois": [
+                    {
+                        "roi_id": route_roi.roi_id,
+                        "bounds": route_roi.bounds,
+                        "member_ids": list(route_roi.member_ids),
+                        "held_ids": list(route_roi.held_ids),
+                        "direction": route_roi.direction,
+                        "state": route_roi.state,
+                    }
+                    for route_roi in physical_roi.rois
+                ]
+            }
+            if physical_roi is not None
+            else None
         ),
         "roi": roi,
         "person_suppressed": person_suppressed,
@@ -961,6 +1283,25 @@ def _events(
             ),
             "fallen_votes_applied": sum(
                 bool(item.get("classifier", {}).get("fallen_vote_applied"))
+                for item in detections
+            ),
+            "physical_recovery_candidates": sum(
+                item.get("postprocess_status")
+                in {
+                    "physical_recovery_candidate",
+                    "physical_recovery_matched",
+                }
+                for item in detections
+            ),
+            "physical_recovery_matched": sum(
+                item.get("postprocess_status") == "physical_recovery_matched"
+                for item in detections
+            ),
+            "physical_small_candidates": sum(
+                bool(item.get("physical_only")) for item in detections
+            ),
+            "physical_small_matched": sum(
+                item.get("postprocess_status") == "physical_small_matched"
                 for item in detections
             ),
         },
@@ -1038,6 +1379,7 @@ def _events(
         "fallen_alert_policy": (
             fallen_tracking.policy if fallen_tracking is not None else None
         ),
+        "fallen_missing_suppression": fallen_missing_suppression,
         "gap_thresholds": (
             [
                 {
@@ -1170,6 +1512,16 @@ def _video_fps(cv2: Any, source: str) -> float:
     return fps if fps > 0 else 25.0
 
 
+def _sha256_file(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _ground_projector_from_args(args: argparse.Namespace) -> GroundPlaneProjector | None:
     pitch_provided = args.camera_pitch_deg is not None
     hfov_provided = args.camera_hfov_deg is not None
@@ -1219,6 +1571,41 @@ def main() -> int:
         raise SystemExit("--cone-count-max-missed-frames must not be negative")
     if args.cone_count_match_distance_ratio <= 0.0:
         raise SystemExit("--cone-count-match-distance-ratio must be positive")
+    if args.physical_max_missed_frames < 0:
+        raise SystemExit("--physical-max-missed-frames must not be negative")
+    if args.physical_match_distance <= 0.0:
+        raise SystemExit("--physical-match-distance must be positive")
+    if not 0.0 <= args.conf <= 1.0:
+        raise SystemExit("--conf must be in [0, 1]")
+    if not 0.0 <= args.physical_match_conf <= args.conf:
+        raise SystemExit("--physical-match-conf must be in [0, --conf]")
+    if not args.conf <= args.physical_small_cone_conf <= 1.0:
+        raise SystemExit("--physical-small-cone-conf must be in [--conf, 1]")
+    if not 0.0 < args.physical_roi_smoothing <= 1.0:
+        raise SystemExit("--physical-roi-smoothing must be in (0, 1]")
+    if args.physical_roi_padding < 0.0:
+        raise SystemExit("--physical-roi-padding must not be negative")
+    if args.physical_roi_hold_frames < 0:
+        raise SystemExit("--physical-roi-hold-frames must not be negative")
+    if args.physical_roi_confirm_frames < 1:
+        raise SystemExit("--physical-roi-confirm-frames must be at least 1")
+    if args.physical_roi_min_cones < 2:
+        raise SystemExit("--physical-roi-min-cones must be at least 2")
+    if args.physical_roi_lateral_ratio <= 0.0:
+        raise SystemExit("--physical-roi-lateral-ratio must be positive")
+    if args.physical_roi_link_ratio <= 1.0:
+        raise SystemExit("--physical-roi-link-ratio must be greater than 1")
+    if not 0.0 < args.physical_roi_max_angle < 90.0:
+        raise SystemExit("--physical-roi-max-angle must be in (0, 90)")
+    if args.physical_roi_identity_memory_frames < args.physical_roi_hold_frames:
+        raise SystemExit(
+            "--physical-roi-identity-memory-frames must be at least "
+            "--physical-roi-hold-frames"
+        )
+    if args.fallen_clear_frames < 1:
+        raise SystemExit("--fallen-clear-frames must be at least 1")
+    if args.fallen_max_missed_frames < 0:
+        raise SystemExit("--fallen-max-missed-frames must not be negative")
     if args.classifier_thresholds is not None and args.classifier_weights is None:
         raise SystemExit("--classifier-thresholds requires --classifier-weights")
     ground_projector = _ground_projector_from_args(args)
@@ -1266,11 +1653,22 @@ def main() -> int:
     except ValueError as exc:
         raise SystemExit("--person-classes must contain comma-separated integers") from exc
     source: str | int = int(args.source) if args.source.isdigit() else args.source
+    source_path = Path(args.source)
+    is_video = (
+        args.source.isdigit()
+        or source_path.suffix.lower() in VIDEO_SUFFIXES
+        or args.source.startswith(("rtsp://", "rtmp://", "http://", "https://"))
+    )
+    detector_confidence = (
+        args.physical_match_conf
+        if args.physical_roi and is_video
+        else args.conf
+    )
     predict_args = {
         "source": source,
         "stream": True,
         "imgsz": args.imgsz,
-        "conf": args.conf,
+        "conf": detector_confidence,
         "iou": args.iou,
         "verbose": False,
     }
@@ -1280,14 +1678,81 @@ def main() -> int:
     args.output.mkdir(parents=True, exist_ok=True)
     event_path = args.output / "events.jsonl"
     cone_count_path = args.output / "cone_count.json"
+    source_hash = _sha256_file(Path(args.source)) if Path(args.source).is_file() else None
+    run_config_path = args.output / "run_config.json"
+    run_config = {
+        "experiment_name": args.experiment_name,
+        "command": [str(item) for item in sys.argv],
+        "arguments": {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+        },
+        "weights": {
+            "path": str(args.weights.resolve()),
+            "sha256": _sha256_file(args.weights.resolve()),
+        },
+        "classifier_weights": (
+            {
+                "path": str(args.classifier_weights.resolve()),
+                "sha256": _sha256_file(args.classifier_weights.resolve()),
+                "thresholds_path": (
+                    str(args.classifier_thresholds.resolve())
+                    if args.classifier_thresholds is not None
+                    else str(
+                        (args.classifier_weights.parent / "thresholds.json").resolve()
+                    )
+                ),
+                "thresholds_sha256": _sha256_file(
+                    (
+                        args.classifier_thresholds
+                        if args.classifier_thresholds is not None
+                        else args.classifier_weights.parent / "thresholds.json"
+                    ).resolve()
+                ),
+            }
+            if args.classifier_weights is not None
+            else None
+        ),
+        "source": {
+            "path": str(Path(args.source).resolve())
+            if Path(args.source).exists()
+            else args.source,
+            "sha256": source_hash,
+        },
+        "counting": {
+            "confirm_window": args.cone_count_confirm_window,
+            "confirm_votes": args.cone_count_confirm_votes,
+            "max_missed_frames": args.cone_count_max_missed_frames,
+            "match_distance_ratio": args.cone_count_match_distance_ratio,
+        },
+        "physical_roi": {
+            "enabled": args.physical_roi,
+            "max_missed_frames": args.physical_max_missed_frames,
+            "match_distance_pixels": args.physical_match_distance,
+            "new_id_confidence": args.conf,
+            "existing_id_match_confidence": args.physical_match_conf,
+            "small_cone_physical_confidence": args.physical_small_cone_conf,
+            "roi_smoothing": args.physical_roi_smoothing,
+            "roi_padding": args.physical_roi_padding,
+            "roi_hold_frames": args.physical_roi_hold_frames,
+            "roi_confirm_frames": args.physical_roi_confirm_frames,
+            "roi_min_cones": args.physical_roi_min_cones,
+            "roi_lateral_distance_ratio": args.physical_roi_lateral_ratio,
+            "roi_longitudinal_link_ratio": args.physical_roi_link_ratio,
+            "roi_max_direction_difference": args.physical_roi_max_angle,
+            "roi_identity_memory_frames": (
+                args.physical_roi_identity_memory_frames
+            ),
+            "anomaly_detection": "unchanged_route_tracker_path",
+        },
+        "fallen_missing_suppression": not args.no_fallen_missing_suppression,
+    }
+    run_config_path.write_text(
+        json.dumps(run_config, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     structured_alert_path = args.output / "alert.jsonl"
     review_alert_path = args.output / "alert.log"
-    source_path = Path(args.source)
-    is_video = (
-        args.source.isdigit()
-        or source_path.suffix.lower() in VIDEO_SUFFIXES
-        or args.source.startswith(("rtsp://", "rtmp://", "http://", "https://"))
-    )
     video_fps = _video_fps(cv2, args.source) if is_video else 0.0
     if args.gap_suspect_seconds <= 0.0:
         raise SystemExit("--gap-suspect-seconds must be positive")
@@ -1303,6 +1768,41 @@ def main() -> int:
             max_smoothing=args.roi_max_smoothing,
         )
         if is_video and not args.no_temporal_roi
+        else None
+    )
+    physical_motion_estimator = (
+        GroundMotionEstimator(cv2, np)
+        if args.physical_roi and is_video
+        else None
+    )
+    physical_counter = (
+        UavPhysicalCounter(
+            confirm_window=(args.cone_count_confirm_window if is_video else 1),
+            confirm_votes=(
+                min(args.cone_count_confirm_votes, args.cone_count_confirm_window)
+                if is_video
+                else 1
+            ),
+            max_missed_frames=args.physical_max_missed_frames,
+            match_distance_pixels=args.physical_match_distance,
+            new_id_on_degraded_motion=False,
+        )
+        if args.physical_roi and is_video
+        else None
+    )
+    physical_roi_tracker = (
+        PhysicalRoiTracker(
+            smoothing=args.physical_roi_smoothing,
+            padding=args.physical_roi_padding,
+            hold_frames=args.physical_roi_hold_frames,
+            confirm_frames=args.physical_roi_confirm_frames,
+            min_cones=args.physical_roi_min_cones,
+            lateral_distance_ratio=args.physical_roi_lateral_ratio,
+            longitudinal_link_ratio=args.physical_roi_link_ratio,
+            max_direction_difference=args.physical_roi_max_angle,
+            identity_memory_frames=args.physical_roi_identity_memory_frames,
+        )
+        if args.physical_roi and is_video
         else None
     )
     gap_tracker = (
@@ -1341,6 +1841,8 @@ def main() -> int:
     fallen_tracker = ConeTrackRegistry(
         vote_window=args.fallen_vote_window,
         confirm_votes=args.fallen_confirm_votes,
+        clear_frames=args.fallen_clear_frames,
+        max_missed_frames=args.fallen_max_missed_frames,
         reactivation_cooldown_frames=args.fallen_reactivation_cooldown_frames,
         match_distance_ratio=args.fallen_match_distance_ratio,
         max_angle_jump_degrees=args.fallen_max_angle_jump,
@@ -1358,6 +1860,7 @@ def main() -> int:
     review_alert_file = review_alert_path.open("w", encoding="utf-8")
     alert_journal = AlertJournal()
     last_cone_counting: ConeCountingResult | None = None
+    last_physical_counting: PhysicalCountResult | None = None
     try:
         for frame_index, result in enumerate(model.predict(**predict_args)):
             video_time_seconds = (
@@ -1365,7 +1868,11 @@ def main() -> int:
             )
             frame = result.orig_img.copy()
             height, width = frame.shape[:2]
-            person_boxes = _same_model_exclusion_boxes(result, excluded_classes)
+            person_boxes = _same_model_exclusion_boxes(
+                result,
+                excluded_classes,
+                minimum_confidence=args.conf,
+            )
             if person_model is not None:
                 person_result = person_model.predict(
                     frame,
@@ -1379,6 +1886,7 @@ def main() -> int:
                     person_boxes.extend(person_result.boxes.xyxy.detach().cpu().tolist())
             (
                 cones,
+                physical_candidates,
                 detections,
                 person_suppressed,
                 small_cone_suppressed,
@@ -1392,6 +1900,8 @@ def main() -> int:
                 candidate_classifier=candidate_classifier,
                 frame=frame,
                 classifier_mode=args.classifier_mode,
+                primary_confidence=args.conf,
+                physical_small_cone_conf=args.physical_small_cone_conf,
             )
             analysis = analyze_cones(
                 cones,
@@ -1432,6 +1942,85 @@ def main() -> int:
             )
             cone_counting = cone_counter.update(analysis)
             last_cone_counting = cone_counting
+            physical_counting: PhysicalCountResult | None = None
+            physical_roi: PhysicalRoiResult | None = None
+            ordered_physical_ids: tuple[int | None, ...] = ()
+            physical_detection_bounds: dict[
+                int, tuple[float, float, float, float]
+            ] = {}
+            if physical_motion_estimator is not None and physical_counter is not None:
+                motion = physical_motion_estimator.update(
+                    frame,
+                    [detection.polygon for detection in physical_candidates],
+                )
+                physical_counting = physical_counter.update(
+                    [
+                        detection.ground_contact
+                        for detection in physical_candidates
+                    ],
+                    [detection.center for detection in physical_candidates],
+                    motion,
+                    can_create_physical_id=[
+                        detection.confidence >= args.conf
+                        for detection in physical_candidates
+                    ],
+                )
+                last_physical_counting = physical_counting
+                detection_record_by_polygon = {
+                    tuple(tuple(point) for point in item["polygon"]): item
+                    for item in detections
+                    if item.get("label") == args.cone_class
+                }
+                for detection_index in physical_counting.recovery_detection_indices:
+                    recovery_detection = physical_candidates[detection_index]
+                    record = detection_record_by_polygon.get(
+                        recovery_detection.polygon
+                    )
+                    if record is None:
+                        continue
+                    record["postprocess_status"] = "physical_recovery_matched"
+                    record["physical_id"] = (
+                        physical_counting.detection_to_physical_id[detection_index]
+                    )
+                for detection, physical_id in zip(
+                    physical_candidates,
+                    physical_counting.detection_to_physical_id,
+                ):
+                    if physical_id is None:
+                        continue
+                    record = detection_record_by_polygon.get(detection.polygon)
+                    if record is not None and record.get("physical_only"):
+                        record["postprocess_status"] = "physical_small_matched"
+                        record["physical_id"] = physical_id
+                for detection, physical_id in zip(
+                    physical_candidates,
+                    physical_counting.detection_to_physical_id,
+                ):
+                    if physical_id is None:
+                        continue
+                    physical_detection_bounds[physical_id] = (
+                        min(point[0] for point in detection.polygon),
+                        min(point[1] for point in detection.polygon),
+                        max(point[0] for point in detection.polygon),
+                        max(point[1] for point in detection.polygon),
+                    )
+                physical_id_by_detection = {
+                    id(detection): physical_id
+                    for detection, physical_id in zip(
+                        physical_candidates,
+                        physical_counting.detection_to_physical_id,
+                    )
+                }
+                ordered_physical_ids = tuple(
+                    physical_id_by_detection.get(id(detection))
+                    for detection in analysis.ordered
+                )
+                if physical_roi_tracker is not None:
+                    physical_roi = physical_roi_tracker.update(
+                        physical_counting.tracks,
+                        physical_detection_bounds,
+                        (width, height),
+                    )
             fallen_tracking = fallen_tracker.update(analysis, tracking)
             active_fallen_indices = tuple(
                 observation.index for observation in fallen_tracking.active
@@ -1445,8 +2034,16 @@ def main() -> int:
                     analysis,
                     tracking,
                     gap_ratio=args.gap_ratio,
-                    fallen_indices=active_fallen_indices,
-                    fallen_stable_ids=active_fallen_ids,
+                    fallen_indices=(
+                        ()
+                        if args.no_fallen_missing_suppression
+                        else active_fallen_indices
+                    ),
+                    fallen_stable_ids=(
+                        {}
+                        if args.no_fallen_missing_suppression
+                        else active_fallen_ids
+                    ),
                 )
                 if gap_tracker is not None and tracking is not None
                 else None
@@ -1491,6 +2088,8 @@ def main() -> int:
                 confirmed_shift_route_ids,
                 fallen_tracking,
                 cone_counting,
+                physical_counting,
+                physical_roi,
             )
             event = _events(
                 frame_index,
@@ -1507,6 +2106,12 @@ def main() -> int:
                 args.shift_membership_stable_frames,
                 fallen_tracking,
                 cone_counting=cone_counting,
+                physical_counting=physical_counting,
+                physical_roi=physical_roi,
+                ordered_physical_ids=ordered_physical_ids,
+                fallen_missing_suppression=(
+                    not args.no_fallen_missing_suppression
+                ),
                 small_cone_suppressed=small_cone_suppressed,
                 classifier_policy=classifier_policy,
                 classifier_timing_ms=(
@@ -1567,7 +2172,40 @@ def main() -> int:
     print(f"Inference events: {event_path}")
     print(f"Structured alerts: {structured_alert_path}")
     print(f"Review alerts: {review_alert_path}")
-    if last_cone_counting is not None:
+    if last_physical_counting is not None:
+        count_summary = {
+            "counting_mode": "uav_physical_id",
+            "unique_seen_count": last_physical_counting.unique_seen_count,
+            "last_stable_visible_count": (
+                last_physical_counting.stable_visible_count
+            ),
+            "last_active_cone_ids": list(
+                last_physical_counting.active_physical_ids
+            ),
+            "last_held_cone_ids": list(last_physical_counting.held_physical_ids),
+            "counting_policy": last_physical_counting.policy,
+            "legacy_comparison": (
+                {
+                    "unique_seen_count": last_cone_counting.unique_seen_count,
+                    "last_stable_visible_count": (
+                        last_cone_counting.stable_visible_count
+                    ),
+                }
+                if last_cone_counting is not None
+                else None
+            ),
+        }
+        cone_count_path.write_text(
+            json.dumps(count_summary, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(
+            "Physical cone counting: "
+            f"stable_visible={last_physical_counting.stable_visible_count} "
+            f"unique_seen={last_physical_counting.unique_seen_count}"
+        )
+        print(f"Cone count summary: {cone_count_path}")
+    elif last_cone_counting is not None:
         cone_count_path.write_text(
             json.dumps(
                 {

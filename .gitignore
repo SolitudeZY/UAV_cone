@@ -26,6 +26,10 @@ MANIFEST
 doc/
 script/runs/
 script/archive/
+!script/archive/
+script/archive/*
+!script/archive/20260827_script_cleanup/
+!script/archive/20260827_script_cleanup/**
 doc
 script/runs
 

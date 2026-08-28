@@ -222,12 +222,19 @@ def main() -> int:
                     device=args.device,
                     verbose=False,
                 )[0]
-                _, detections, _, small_cone_suppressed = _extract_detections(
+                (
+                    _,
+                    _,
+                    detections,
+                    _,
+                    small_cone_suppressed,
+                ) = _extract_detections(
                     result,
                     "cone",
                     None,
                     image_size=(info.width, info.height),
                     min_cone_long_side_ratio=args.min_cone_long_side_ratio,
+                    primary_confidence=args.conf,
                 )
                 annotated = _draw_detections(
                     cv2, np, frame.copy(), detections

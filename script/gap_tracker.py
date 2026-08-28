@@ -478,7 +478,11 @@ class GapThresholdTracker:
         if positive:
             gap.last_alert = candidate.alert
             gap.normal_streak = 0
-            if candidate.credible and candidate.distance_ratio >= self.alert_ratio:
+            if (
+                can_activate
+                and candidate.credible
+                and candidate.distance_ratio >= self.alert_ratio
+            ):
                 gap.strong_alert_streak += 1
             else:
                 gap.strong_alert_streak = 0
@@ -493,6 +497,9 @@ class GapThresholdTracker:
         ):
             gap.level = "suspect"
             gap.suspect_frames = 1
+            # Strong evidence collected while the route history was warming up
+            # must not skip the visible suspect stage on the first eligible frame.
+            gap.strong_alert_streak = 0
         elif gap.level in {"suspect", "alert"}:
             gap.suspect_frames += 1
 
