@@ -650,6 +650,23 @@ def _route_id(analysis: AnalysisResult, detection_index: int) -> int | None:
     )
 
 
+def _physical_route_member_ids(
+    routes: Sequence[Sequence[int]],
+    ordered_physical_ids: Sequence[int | None],
+) -> tuple[tuple[int, ...], ...]:
+    groups = []
+    for route in routes:
+        member_ids = {
+            ordered_physical_ids[index]
+            for index in route
+            if 0 <= index < len(ordered_physical_ids)
+            and ordered_physical_ids[index] is not None
+        }
+        if len(member_ids) >= 2:
+            groups.append(tuple(sorted(member_ids)))
+    return tuple(groups)
+
+
 def _stable_route_id(
     analysis: AnalysisResult,
     detection_index: int,
@@ -1727,6 +1744,7 @@ def main() -> int:
         },
         "physical_roi": {
             "enabled": args.physical_roi,
+            "route_source": "analysis.routes",
             "max_missed_frames": args.physical_max_missed_frames,
             "match_distance_pixels": args.physical_match_distance,
             "new_id_confidence": args.conf,
@@ -2020,6 +2038,10 @@ def main() -> int:
                         physical_counting.tracks,
                         physical_detection_bounds,
                         (width, height),
+                        route_member_ids=_physical_route_member_ids(
+                            analysis.routes,
+                            ordered_physical_ids,
+                        ),
                     )
             fallen_tracking = fallen_tracker.update(analysis, tracking)
             active_fallen_indices = tuple(

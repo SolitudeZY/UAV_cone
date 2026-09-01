@@ -577,6 +577,77 @@ class PhysicalRoiTracker:
         observations.sort(key=lambda item: (item.map_center[0], item.map_center[1]))
         return observations
 
+    def _explicit_route_observations(
+        self,
+        tracks: Sequence[PhysicalTrack],
+        route_member_ids: Sequence[Sequence[int]],
+    ) -> list[_PhysicalRouteObservation]:
+        tracks_by_id = {track.physical_id: track for track in tracks}
+        observations = []
+        for member_ids in route_member_ids:
+            group_tracks = [
+                tracks_by_id[physical_id]
+                for physical_id in dict.fromkeys(member_ids)
+                if physical_id in tracks_by_id
+            ]
+            if len(group_tracks) < self.min_cones:
+                continue
+            points = [track.map_point for track in group_tracks]
+            observations.append(
+                _PhysicalRouteObservation(
+                    member_ids=tuple(
+                        sorted(track.physical_id for track in group_tracks)
+                    ),
+                    member_points=tuple(
+                        sorted(
+                            (track.physical_id, track.map_point)
+                            for track in group_tracks
+                        )
+                    ),
+                    direction=self._principal_direction(points),
+                    map_center=(
+                        statistics.fmean(point[0] for point in points),
+                        statistics.fmean(point[1] for point in points),
+                    ),
+                    spacing=self._local_spacing(points),
+                )
+            )
+        observations.sort(key=lambda item: (item.map_center[0], item.map_center[1]))
+        return observations
+
+    def _retain_held_members(
+        self,
+        state: _PhysicalRoiState,
+        observation: _PhysicalRouteObservation,
+        tracks_by_id: dict[int, PhysicalTrack],
+    ) -> _PhysicalRouteObservation:
+        if not set(state.member_ids).intersection(observation.member_ids):
+            return observation
+        member_ids = set(observation.member_ids)
+        member_ids.update(
+            physical_id
+            for physical_id in state.member_ids
+            if physical_id in tracks_by_id
+            and tracks_by_id[physical_id].state == "held"
+            and tracks_by_id[physical_id].missed_frames <= self.hold_frames
+        )
+        if len(member_ids) == len(observation.member_ids):
+            return observation
+        group_tracks = [tracks_by_id[physical_id] for physical_id in sorted(member_ids)]
+        points = [track.map_point for track in group_tracks]
+        return _PhysicalRouteObservation(
+            member_ids=tuple(track.physical_id for track in group_tracks),
+            member_points=tuple(
+                (track.physical_id, track.map_point) for track in group_tracks
+            ),
+            direction=self._principal_direction(points),
+            map_center=(
+                statistics.fmean(point[0] for point in points),
+                statistics.fmean(point[1] for point in points),
+            ),
+            spacing=self._local_spacing(points),
+        )
+
     @staticmethod
     def _clip(
         bounds: tuple[float, float, float, float], image_size: tuple[int, int]
@@ -628,6 +699,8 @@ class PhysicalRoiTracker:
         tracks: Sequence[PhysicalTrack],
         detection_bounds: dict[int, tuple[float, float, float, float]],
         image_size: tuple[int, int],
+        *,
+        route_member_ids: Sequence[Sequence[int]] | None = None,
     ) -> PhysicalRoiResult:
         usable = [
             track
@@ -646,7 +719,11 @@ class PhysicalRoiTracker:
             if physical_id in usable_ids
         }
 
-        observations = self._route_observations(usable)
+        observations = (
+            self._route_observations(usable)
+            if route_member_ids is None
+            else self._explicit_route_observations(usable, route_member_ids)
+        )
         assignments: dict[int, int] = {}
         used_states: set[int] = set()
         used_observations: set[int] = set()
@@ -760,7 +837,11 @@ class PhysicalRoiTracker:
                 retained.append(state)
                 continue
 
-            observation = observations[observation_index]
+            observation = self._retain_held_members(
+                state,
+                observations[observation_index],
+                tracks_by_id,
+            )
             raw = self._raw_bounds(
                 observation.member_ids, tracks_by_id, image_size
             )

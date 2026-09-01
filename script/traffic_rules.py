@@ -423,7 +423,9 @@ def _adaptive_route_groups(
                 order_along_route(hinted[index]) for index in sorted(hinted)
             )
             if group_residual:
-                stabilized.append(order_along_route(group_residual))
+                stabilized.extend(
+                    _adaptive_route_groups(group_residual, link_ratio)
+                )
         groups = stabilized
 
     groups.sort(

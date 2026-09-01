@@ -8,9 +8,9 @@ from collections import deque
 
 import numpy as np
 
-from infer_obb import _extract_detections, build_parser
+from infer_obb import _extract_detections, _physical_route_member_ids, build_parser
 from gap_tracker import GapThresholdTracker, _MissingCandidate, _StableGapState
-from traffic_rules import MissingAlert
+from traffic_rules import ConeDetection, MissingAlert, analyze_cones
 from uav_physical_cone_counter import (
     MotionEstimate,
     PhysicalRoiTracker,
@@ -250,7 +250,50 @@ class DetectionThresholdSplitTest(unittest.TestCase):
         self.assertNotIn("physical_only", detections[1])
 
 
+class AdaptiveRouteGroupingTest(unittest.TestCase):
+    @staticmethod
+    def cone(center_x: float) -> ConeDetection:
+        return ConeDetection(
+            polygon=(
+                (center_x - 2.0, -2.0),
+                (center_x + 2.0, -2.0),
+                (center_x + 2.0, 2.0),
+                (center_x - 2.0, 2.0),
+            ),
+            confidence=0.9,
+        )
+
+    def test_unhinted_residuals_are_regrouped_by_connectivity(self) -> None:
+        analysis = analyze_cones(
+            [self.cone(x) for x in (0.0, 10.0, 35.0, 45.0, 55.0, 80.0)],
+            route_link_ratio=3.0,
+            route_hints=[[(35.0, 0.0), (45.0, 0.0), (55.0, 0.0)]],
+            route_hint_ratio=2.0,
+            min_route_cones=2,
+        )
+
+        route_centers = [
+            tuple(round(analysis.ordered[index].center[0]) for index in route)
+            for route in analysis.routes
+        ]
+        isolated_centers = [
+            round(analysis.ordered[index].center[0])
+            for index in analysis.isolated
+        ]
+
+        self.assertEqual(route_centers, [(0, 10), (35, 45, 55)])
+        self.assertEqual(isolated_centers, [80])
+
+
 class InferParserTest(unittest.TestCase):
+    def test_analysis_routes_map_to_disjoint_physical_id_groups(self) -> None:
+        groups = _physical_route_member_ids(
+            [[0, 1], [2, 3], [4]],
+            (14, 12, 15, None, 16),
+        )
+
+        self.assertEqual(groups, ((12, 14),))
+
     def test_physical_roi_is_default_and_can_be_disabled(self) -> None:
         parser = build_parser()
         default = parser.parse_args(["--weights", "model.pt", "--source", "video.mp4"])
@@ -347,6 +390,70 @@ class PhysicalRoiTrackerTest(unittest.TestCase):
             {(1, 2, 3, 4, 5), (6, 7, 8)},
         )
         self.assertEqual(len({roi.roi_id for roi in grouped.rois}), 2)
+
+    def test_explicit_routes_prevent_cross_route_regrouping(self) -> None:
+        tracker = PhysicalRoiTracker(
+            smoothing=0.25,
+            padding=0.0,
+            hold_frames=8,
+            confirm_frames=3,
+        )
+        tracks = [
+            self.track(12, (-199.0, -949.0)),
+            self.track(14, (-196.0, -994.0)),
+            self.track(15, (-50.0, -1018.0)),
+        ]
+
+        grouped = None
+        for _ in range(3):
+            grouped = tracker.update(
+                tracks,
+                self.bounds(tracks),
+                (1280, 720),
+                route_member_ids=((12, 14),),
+            )
+        assert grouped is not None
+
+        self.assertEqual(len(grouped.rois), 1)
+        self.assertEqual(grouped.rois[0].member_ids, (12, 14))
+
+    def test_explicit_route_keeps_a_short_held_member(self) -> None:
+        tracker = PhysicalRoiTracker(
+            smoothing=0.25,
+            padding=0.0,
+            hold_frames=8,
+            confirm_frames=3,
+        )
+        tracks = [
+            self.track(1, (100.0, 100.0)),
+            self.track(2, (100.0, 150.0)),
+            self.track(3, (100.0, 200.0)),
+        ]
+        initial = None
+        for _ in range(3):
+            initial = tracker.update(
+                tracks,
+                self.bounds(tracks),
+                (1280, 720),
+                route_member_ids=((1, 2, 3),),
+            )
+        assert initial is not None
+        held_tracks = [
+            tracks[0],
+            self.track(2, (100.0, 150.0), state="held", missed_frames=1),
+            tracks[2],
+        ]
+
+        held = tracker.update(
+            held_tracks,
+            self.bounds(held_tracks),
+            (1280, 720),
+            route_member_ids=((1, 3),),
+        )
+
+        self.assertEqual(len(held.rois), 1)
+        self.assertEqual(held.rois[0].member_ids, (1, 2, 3))
+        self.assertEqual(held.rois[0].held_ids, (2,))
 
     def test_collinear_batches_with_large_gap_form_two_rois(self) -> None:
         tracker = PhysicalRoiTracker(
