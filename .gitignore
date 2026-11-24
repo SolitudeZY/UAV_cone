@@ -49,3 +49,11 @@ script/test-video/
 *.pth
 *.mp4
 *.avi
+
+# Deployment artifacts (ONNX / TensorRT / RKNN)
+*.onnx
+*.engine
+*.rknn
+
+# Local tool caches
+.pytest_cache/
